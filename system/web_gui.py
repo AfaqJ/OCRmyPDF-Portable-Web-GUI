@@ -350,6 +350,7 @@ a.dl{display:inline-block;padding:7px 12px;background:var(--accent-soft);
       <label class=opt><input type=checkbox id=redo><span data-t=o_redo></span></label>
       <p class=hint data-t=h_redo></p>
       <label class=opt><input type=checkbox id=verbose checked><span data-t=o_verbose></span></label>
+      <p class=hint data-t=h_verbose></p>
     </div>
     <div class=panel>
       <div class=actions>
@@ -387,8 +388,9 @@ const STR={
   o_rotate:"Auto-rotate pages", h_rotate:"Turns sideways and upside-down scans upright before reading them",
   o_redo:"Redo OCR (replace existing text layer)",
   h_redo:"For files another tool already OCR'd badly. Off means pages that already hold real text are skipped untouched",
-  o_verbose:"Detailed record",
-  s_rec:"Record", live:"live", idle:"No run yet",
+  o_verbose:"Show technical detail in the log",
+  h_verbose:"Every internal step, not just what happened to each page",
+  s_rec:"Log", live:"live", idle:"No run yet",
   start:"Start OCR", cancel:"Cancel run", save:"Save to folder",
   running:"Running…", left:t=>`about ${t} left`,
   q_done:"done", q_run:p=>`page ${p}`, q_wait:"queued", q_fail:"failed", q_cancel:"cancelled",
@@ -406,7 +408,8 @@ const STR={
   o_rotate:"تدوير الصفحات تلقائيًا", h_rotate:"يعيد الصفحات الجانبية والمقلوبة إلى وضعها الصحيح قبل قراءتها",
   o_redo:"إعادة التعرّف الضوئي (استبدال طبقة النص الحالية)",
   h_redo:"للملفات التي عالجها برنامج آخر بشكل خاطئ. عند إيقافه تُترك الصفحات التي تحتوي نصًا حقيقيًا كما هي",
-  o_verbose:"سجل تفصيلي",
+  o_verbose:"إظهار التفاصيل التقنية في السجل",
+  h_verbose:"كل خطوة داخلية، وليس ما حدث لكل صفحة فقط",
   s_rec:"السجل", live:"مباشر", idle:"لا توجد عملية بعد",
   start:"بدء المعالجة", cancel:"إلغاء العملية", save:"حفظ في المجلد",
   running:"جارٍ التنفيذ…", left:t=>`يتبقى نحو ${t}`,
@@ -727,7 +730,8 @@ def selftest():
     assert eta_seconds() is None
     STATE.update(units_done=0, units_total=0, started=0.0)
 
-    for key in ("title", "o_redo", "w_body", "l_both", "q_run"):
+    assert "Detailed record" not in PAGE and "h_verbose" in PAGE
+    for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose"):
         assert f"{key}:" in PAGE, key
     assert "PDF/A" not in PAGE and "NAPS2" not in PAGE and "deskew" not in PAGE.lower()
     assert "العربية" in PAGE and "rtl" in PAGE
