@@ -1,0 +1,84 @@
+OCRmyPDF Portable (Windows 64-bit) - adds an invisible text layer to scanned PDFs
+=================================================================================
+
+Nothing is installed. Nothing is written to the registry or to PATH.
+Everything lives inside this folder; delete the folder and it is gone.
+
+FIRST
+  Extract the whole folder to disk (do NOT run it from inside the .zip), then
+  double-click "Self test.bat". Six checks run. Steps 5 and 6 are the real
+  ones: step 5 OCRs the bundled test page and prints the text it read back,
+  step 6 OCRs a sideways page and reports that it was turned upright.
+
+TWO WAYS TO USE IT
+
+  A) The window - double-click "Start OCRmyPDF.bat"
+     A small black console opens (leave it open - that IS the program) and
+     your browser opens on the tool. Then:
+       1. drag PDFs onto the page, or click to browse
+       2. choose the folder where results should go
+       3. tick options, press Start OCR, watch the live log
+       4. press "Save to folder", or use the download links
+     The page is served from your own PC on 127.0.0.1 and never touches the
+     network. Closing the console window shuts it down.
+
+  B) Drag and drop - drag PDFs onto "OCR (drag PDFs here).bat"
+     Each result is written next to the original as NAME_ocr.pdf. No window,
+     no clicking. Best for a big batch.
+
+  Your original PDFs are never modified either way.
+
+  C) Command line - open cmd.exe in this folder:
+       env.bat
+       app\python.exe -m ocrmypdf -l eng --skip-text in.pdf out.pdf
+     env.bat must run first in that same window; it sets PATH, TESSDATA_PREFIX
+     and the Python variables. Without it you get
+     "Could not find program 'tesseract' on the PATH".
+
+ROTATION
+  Scans of landscape sheets stored on portrait pages, and pages fed in upside
+  down, are turned upright automatically. Both .bat files already pass:
+      --rotate-pages --rotate-pages-threshold 0.1
+  The threshold matters. Tesseract reports an orientation plus a confidence,
+  and confidence tracks how much text is on the page: dense contract pages
+  score 26-34, sparse drawings score 0.7-1.6. OCRmyPDF's default threshold of
+  14 therefore refuses to rotate exactly the drawing sheets that need it. At
+  0.1 they all rotate, and pages that are already upright are still left alone
+  (an upright page reports 0 degrees, and a zero correction is ignored however
+  low the threshold goes).
+
+  "Check rotation (drag PDFs here).bat" reports each page's detected angle and
+  confidence without changing anything - use it when one file misbehaves.
+
+USEFUL FLAGS
+  --skip-text      leave pages that already contain real text untouched
+  --redo-ocr       discard an existing bad text layer and rebuild it - this is
+                   the one for PDFs already processed by NAPS2
+  --deskew         straighten crooked scans (cannot be combined with --redo-ocr)
+  --output-type pdf    keep the original page images and only add the text
+                       layer (the default here)
+  --output-type pdfa   archival PDF/A; rewrites the whole file via Ghostscript
+  --sidecar out.txt    also write the plain OCR text to a file
+
+NOTES
+  - Language is English only (eng). Other languages need the matching
+    .traineddata file in app\share\tessdata.
+  - Expect a few seconds per page; all CPU cores are used.
+  - A page with almost no text - a pure drawing, a stamp, a near-blank sheet -
+    gives the orientation detector nothing to read and is left as-is.
+  - There is no Tk-based window. Tk failed to load on the target machine, so
+    the GUI runs in the browser instead; that path needs nothing but Python's
+    own standard library.
+
+WHAT IS INSIDE
+  app\                     Python 3.12 + Tesseract 5.5.3 + Ghostscript 10.07.1
+  app\Lib\site-packages\   OCRmyPDF 17.10.0 and its Python dependencies
+  app\share\tessdata\      eng + osd language data and the tesseract configs\
+                           directory - OCRmyPDF calls tesseract with the "hocr"
+                           config, so configs\ must sit inside TESSDATA_PREFIX
+  env.bat                  sets the environment; called by the other .bat files
+  web_gui.py               the browser GUI (standard library only, readable)
+  show_rotation.py         reports how a page ended up rotated
+  osd_report.py            per-page orientation report
+  sample_scan.pdf          image-only test page used by the self test
+  sample_rotated.pdf       sideways test page used by the self test
