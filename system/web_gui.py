@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
+from prerotate import prerotate
+
 TOKEN = secrets.token_urlsafe(16)          # keeps other local processes out
 WORK = Path(tempfile.mkdtemp(prefix="ocrmypdf_web_"))
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -62,8 +64,9 @@ def ocr_cmd(src: Path, dst: Path, o: dict) -> list:
            # not ship; with them absent it saves 0 bytes and just prints WinError 2
            "--optimize", "0"]
     cmd += ["--redo-ocr"] if o.get("redo") else ["--skip-text"]
-    if o.get("rotate"):
-        cmd += ["--rotate-pages", "--rotate-pages-threshold", "0.1"]
+    # NB: no --rotate-pages here. Rotating inside OCRmyPDF puts the text layer in
+    # the wrong place when the page already carries a /Rotate flag, which most
+    # scanners set. prerotate.py turns the page upright first instead.
     if o.get("deskew") and not o.get("redo"):     # ocrmypdf rejects this pair
         cmd.append("--deskew")
     return cmd + ["-v", "1", str(src), str(dst)]
@@ -85,7 +88,16 @@ def run_batch(opts: dict) -> None:
         for i, src in enumerate(UPLOADS, 1):
             dst = src.parent / f"{src.stem}_ocr.pdf"
             log(f"[{i}/{len(UPLOADS)}] {src.name}")
-            p = subprocess.Popen(ocr_cmd(src, dst, opts), stdout=subprocess.PIPE,
+            ocr_src = src
+            if opts.get("rotate"):
+                log("   checking which way up each page is...")
+                try:
+                    upright = src.parent / f"{src.stem}_upright.pdf"
+                    prerotate(src, upright, opts.get("lang", "eng").split("+")[0], report=log)
+                    ocr_src = upright
+                except Exception as exc:
+                    log(f"   could not pre-rotate ({exc!r}); reading pages as they are")
+            p = subprocess.Popen(ocr_cmd(ocr_src, dst, opts), stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  errors="replace", env=child_env(),
                                  creationflags=CREATE_NO_WINDOW)
@@ -178,6 +190,7 @@ a.dl{display:inline-block;margin:7px 8px 0 0;padding:8px 14px;background:#e9f1fc
   <div id=drop data-t=drop></div>
   <input type=file id=picker accept=application/pdf multiple hidden>
   <ul id=list></ul>
+  <div class=row style=margin-top:10px><button class=act id=clear data-t=clear></button><span id=count class=sub></span></div>
 </div>
 
 <div class=card><h2><span class=num>2</span><span data-t=s2></span></h2>
@@ -212,7 +225,7 @@ a.dl{display:inline-block;margin:7px 8px 0 0;padding:8px 14px;background:#e9f1fc
     <button class=i data-info=i_deskew>i</button></div>
   <p class=info id=i_deskew data-t=t_deskew></p>
 
-  <div class=opt><input type=checkbox id=verbose><label for=verbose data-t=o_verbose></label>
+  <div class=opt><input type=checkbox id=verbose checked><label for=verbose data-t=o_verbose></label>
     <button class=i data-info=i_verbose>i</button></div>
   <p class=info id=i_verbose data-t=t_verbose></p>
 </div>
@@ -245,7 +258,8 @@ const STR={
      t_deskew:"Straightens pages that went through the scanner at a slight angle of 1 to 3 degrees. Improves reading accuracy, but the page image is re-rendered rather than kept exactly as scanned. Cannot be combined with Redo OCR.",
      o_verbose:"Detailed log",
      t_verbose:"Shows every internal step instead of a short summary. Useful only when something goes wrong.",
-     s4:"Run", start:"Start OCR", save:"Save to folder",
+     s4:"Run", start:"Start OCR", save:"Save to folder", clear:"Clear list",
+     nfiles:n=>`${n} file(s) ready`,
      ready:"Ready. Add some PDFs to begin.", saving:"Saving…",
      saved:n=>`Saved ${n} file(s)`, nofiles:"Add at least one PDF first.",
      notfound:"Folder not found"},
@@ -265,7 +279,8 @@ const STR={
      t_deskew:"يصحح الصفحات التي مرت في الماسح الضوئي بزاوية مائلة بين درجة وثلاث درجات. يحسّن دقة القراءة، لكن تُعاد معالجة صورة الصفحة بدلًا من الاحتفاظ بها كما مُسحت. لا يمكن الجمع بينه وبين إعادة التعرف الضوئي.",
      o_verbose:"سجل تفصيلي",
      t_verbose:"يعرض كل خطوة داخلية بدلًا من ملخص مختصر. مفيد فقط عند حدوث مشكلة.",
-     s4:"التشغيل", start:"بدء المعالجة", save:"حفظ في المجلد",
+     s4:"التشغيل", start:"بدء المعالجة", save:"حفظ في المجلد", clear:"مسح القائمة",
+     nfiles:n=>`${n} ملف جاهز`,
      saving:"جارٍ الحفظ…",   /* the log itself stays English in both languages */
      saved:n=>`تم حفظ ${n} ملف`, nofiles:"أضف ملف PDF واحدًا على الأقل.",
      notfound:"المجلد غير موجود"}};
@@ -303,6 +318,14 @@ function add(fs){
     `<li><b>${f.name}</b><span>${(f.size/1048576).toFixed(1)} MB</span></li>`).join('');
   refresh();
 }
+$('clear').onclick=async()=>{
+  files=[]; results=[]; $('list').innerHTML=''; $('dl').innerHTML='';
+  $('savemsg').textContent=''; $('picker').value='';
+  $('log').textContent=STR.en.ready; $('log').dataset.idle='1';
+  $('prog').style.width='0'; $('save').disabled=true;
+  await fetch(`/reset?t=${T}`,{method:'POST'});
+  refresh();
+};
 
 /* 2. destination */
 $('pick').onclick=async()=>{
@@ -321,13 +344,17 @@ $('path').onchange=async()=>{
   refresh();
 };
 const haveDest=()=>!!dirHandle||$('dest').dataset.set==='1';
-function refresh(){$('go').disabled=!(files.length&&haveDest())}
+function refresh(){
+  $('go').disabled=!(files.length&&haveDest());
+  $('count').textContent=files.length?STR[L].nfiles(files.length):'';
+}
 
 /* 3. run */
 $('go').onclick=async()=>{
   $('go').disabled=$('pick').disabled=true; $('save').disabled=true;
   $('dl').innerHTML=''; $('log').textContent=''; delete $('log').dataset.idle;
   since=0; results=[]; $('prog').style.width='4%';
+  await fetch(`/reset?t=${T}`,{method:'POST'});
   for(const f of files)
     await fetch(`/upload?t=${T}&name=${encodeURIComponent(f.name)}`,{method:'POST',body:f});
   const q=i=>$(i).checked?1:0;
@@ -424,6 +451,12 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if not self._auth(q):
             return
+        if u.path == "/reset":
+            UPLOADS.clear()
+            RESULTS.clear()
+            LOG.clear()
+            STATE.update(running=False, done=False)
+            return self._json({"ok": True})
         if u.path == "/upload":
             name = Path(q.get("name", ["input.pdf"])[0]).name or "input.pdf"
             job = WORK / uuid.uuid4().hex
@@ -479,7 +512,7 @@ def selftest():
     c = ocr_cmd(Path("a.pdf"), Path("b.pdf"), {"rotate": True, "deskew": True, "lang": "eng+ara"})
     assert c[c.index("-l") + 1] == "eng+ara"
     assert "--skip-text" in c and "--deskew" in c
-    assert c[c.index("--rotate-pages-threshold") + 1] == "0.1"
+    assert "--rotate-pages" not in c        # prerotate.py does it first instead
     assert "--output-type" in c and c[c.index("--output-type") + 1] == "pdf"
     assert c[c.index("--optimize") + 1] == "0"      # silences the jbig2/pngquant probes
     r = ocr_cmd(Path("a.pdf"), Path("b.pdf"), {"redo": True, "deskew": True})

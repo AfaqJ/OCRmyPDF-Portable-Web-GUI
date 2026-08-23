@@ -51,17 +51,29 @@ OCRmyPDF always calls tesseract with the `hocr` config — so OCR dies with
 holding the `.pyd`, the system directories, and paths added via
 `os.add_dll_directory()` are searched.
 
-**`--rotate-pages` alone will not rotate drawing sheets.** Tesseract reports an
-orientation *and* a confidence, and confidence tracks how much text is on the page:
+**`--rotate-pages` puts the text layer in the wrong place.** Not always — only when
+the incoming page already carries a `/Rotate` flag, which is what most scanners
+produce. The page is turned correctly and looks right; the invisible text lands
+where the words used to be. Measured on a real scan, page rendered at 150 dpi:
 
-| page | confidence | at the default threshold of 14 |
+| input page | median distance between a word and its text | words matched |
 |---|---|---|
-| dense text (contracts, schedules) | 26 – 34 | rotates |
-| sparse (drawings, single-line diagrams) | 0.7 – 1.6 | **refuses** |
+| upright | 2.8 px | 182 / 185 |
+| sideways, no flag | 2.7 px | 176 / 181 |
+| upside down, no flag | 2.8 px | 184 / 185 |
+| **sideways, with a `/Rotate` flag** | **830.5 px** | **5 / 181** |
 
-The reported angle was correct in every low-confidence case — only the confidence was
-low. `--rotate-pages-threshold 0.1` lets them through, and is safe because an
-upright page reports 0°, which is ignored at any threshold.
+So [`system/prerotate.py`](system/prerotate.py) turns each page upright *first*, and
+OCRmyPDF is then run without `--rotate-pages` on a page that is already the right way
+up. Only `/Rotate` is changed; the scanned pixels are untouched. That brings the last
+row back to 2.7 px and 176 of 181 words.
+
+**Orientation detection gives up on sparse pages.** Tesseract's detector reports a
+confidence that tracks how much text is on the page: dense contract pages score 26–34,
+drawings and title sheets score 0.7–1.6, and pages that are nearly all diagram score
+0.00 and are simply skipped. `prerotate.py` therefore falls back to OCRing all four
+orientations and keeping whichever reads best — four times the work, so it only runs on
+the pages the detector could not settle.
 
 ## Limitations
 
