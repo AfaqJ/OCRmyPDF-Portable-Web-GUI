@@ -4,8 +4,14 @@ Makes scanned PDFs searchable by adding an invisible text layer. Built for a
 locked-down corporate Windows PC: **no installer, no admin rights, no Python on the
 machine, nothing added to PATH or the registry.** Download, extract, double-click.
 
-English and Arabic interface. Pages scanned sideways or upside down are turned
-upright automatically.
+English and Arabic interface, switchable from the top bar. Pages scanned sideways or
+upside down are turned upright automatically, and a run can be cancelled part way
+without losing the queue.
+
+The window is a two-pane console: documents, destination and settings on the left, a
+live record on the right. The record carries the page numbers in a gutter and uses
+colour to mean something — cyan for a page that was turned and the confidence behind
+it, amber for one left alone, green for finished, red for failed.
 
 ## Use it
 

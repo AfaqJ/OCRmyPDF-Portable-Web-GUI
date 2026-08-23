@@ -1,8 +1,7 @@
 """OCRmyPDF front-end that runs in the browser instead of a desktop toolkit.
 
 Python's own http.server serves one page on 127.0.0.1, so this needs no GUI
-library, no extra DLLs and nothing installed. Drop PDFs on the page, choose
-where results go, press Start, watch the log.
+library, no extra DLLs and nothing installed.
 """
 import json, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,29 +19,30 @@ LANGS = {"eng": "eng", "eng+ara": "eng+ara", "ara": "ara"}
 
 UPLOADS: list[Path] = []
 RESULTS: dict[str, Path] = {}
-LOG: list[str] = []
-STATE = {"running": False, "done": False,
+LOG: list[dict] = []                        # {"g": gutter, "k": kind, "t": text}
+FILES: list[dict] = []                      # one row per document, for the queue
+STATE = {"running": False, "done": False, "cancel": False, "proc": None,
          "units_done": 0, "units_total": 0, "stage": "", "started": 0.0}
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-# Things the user must never be shown: probes for optional tools we do not ship,
-# and Python's own complaint about printing an arrow to a legacy console.
+# never shown: probes for optional tools we do not ship, and Python's own
+# complaint about printing an arrow to a legacy console
 JUNK = re.compile(r"\[WinError 2\]|--- Logging error ---|^Traceback|^\s+File \"|^\s+\w.*\^+$|"
                   r"UnicodeEncodeError|^Message: |^Arguments: |^Call stack:|"
                   r"^\s+(self|result|work_item|ocr_image_out|orientation_correction|log)\b")
-# Internal plumbing: hidden unless the detailed log is asked for.
+# internal plumbing: hidden unless the detailed log is asked for
 CHATTER = re.compile(r"^\s*(\d+\s+)?(Running: \[|pikepdf mmap|os\.symlink|xref \d|Recursing into|"
                      r"stdout/stderr = |Evaluating lazy import|Gathering info|Using Tesseract OpenMP|"
                      r"\[tesseract\] OMP:|resolution \(|XrefExt\(|Adjusting rendered|"
                      r".*optimize\.pdf ->|[a-z]{3}(_[a-z]+)*$)")
 PAGE_NO = re.compile(r"^\s*(\d+)\s+\S")     # ocrmypdf -v 1 prefixes lines with the page
 FACING = re.compile(r"(?:^|\s)(\d+)\s+page is facing (.), confidence ([\d.]+) - (.*)")
-ARROWS = {"⇧": "upright", "⇨": "on its side (facing right)",
-          "⇩": "upside down", "⇦": "on its side (facing left)"}
+PRE_LINE = re.compile(r"page (\d+): (turned (\d+) deg clockwise|left upright|too little text[^(]*)"
+                      r"\s*\(?([^)]*)\)?")
 
 
-def log(msg: str) -> None:
-    LOG.append(ANSI.sub("", msg.rstrip()))
+def log(text: str, kind: str = "dim", gutter: str = "") -> None:
+    LOG.append({"g": str(gutter), "k": kind, "t": ANSI.sub("", text.rstrip())})
 
 
 def page_count(pdf: Path) -> int:
@@ -56,8 +56,7 @@ def eta_seconds() -> float | None:
     """Rough time remaining, extrapolated from the pages finished so far.
 
     Pages are OCR'd several at a time, so the counter reaches the total while the
-    last few are still running. Hold it one short of the total so the estimate
-    keeps ticking instead of vanishing during the tail.
+    last few still run. Hold it one short so the estimate keeps ticking.
     """
     if not STATE["running"]:
         return None
@@ -68,278 +67,353 @@ def eta_seconds() -> float | None:
     return (time.time() - STATE["started"]) / done * (total - done)
 
 
-def friendly(line: str) -> str | None:
-    """Turn one ocrmypdf line into something worth showing, or None to drop it."""
-    m = FACING.search(line)
-    if m:
-        page, arrow, conf, action = m.groups()
-        was = ARROWS.get(arrow, "unclear")
-        turned = "turned upright" if "will rotate" in action else "left as it is"
-        return f"   page {page}: {was} -> {turned}  (confidence {float(conf):.2f})"
-    if "Too few characters" in line:
-        return "   (page has too little text to judge its orientation - left as it is)"
-    if re.search(r"\b(ERROR|CRITICAL|Error during processing)\b", line):
-        return "   " + line.strip()
-    return None
-
-
 def ocr_cmd(src: Path, dst: Path, o: dict) -> list:
     cmd = [sys.executable, "-m", "ocrmypdf",
            "-l", LANGS.get(o.get("lang", "eng"), "eng"),
            "--jobs", str(os.cpu_count() or 2), "--output-type", "pdf",
-           # the optimizer only ever calls jbig2/pngquant, which this bundle does
-           # not ship; with them absent it saves 0 bytes and just prints WinError 2
+           # the optimizer only calls jbig2/pngquant, which this bundle does not
+           # ship; with them absent it saves 0 bytes and just prints WinError 2
            "--optimize", "0"]
     cmd += ["--redo-ocr"] if o.get("redo") else ["--skip-text"]
-    # NB: no --rotate-pages here. Rotating inside OCRmyPDF puts the text layer in
-    # the wrong place when the page already carries a /Rotate flag, which most
+    # NB: no --rotate-pages. Rotating inside OCRmyPDF puts the text layer in the
+    # wrong place when the page already carries a /Rotate flag, which most
     # scanners set. prerotate.py turns the page upright first instead.
-    if o.get("deskew") and not o.get("redo"):     # ocrmypdf rejects this pair
-        cmd.append("--deskew")
     return cmd + ["-v", "1", str(src), str(dst)]
 
 
 def child_env() -> dict:
-    """UTF-8 for the child, or it dies trying to print an arrow on a cp1252 console."""
+    """UTF-8 for the child, or it dies printing a rotation arrow to a cp1252 console."""
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     return env
 
 
-def run_batch(opts: dict) -> None:
-    """Worker thread: OCR every uploaded file, streaming output into LOG.
+def classify(line: str) -> tuple[str, str, str] | None:
+    """One ocrmypdf line -> (gutter, kind, text), or None to drop it."""
+    m = FACING.search(line)
+    if m:
+        page, arrow, conf, action = m.groups()
+        if "will rotate" in action:
+            return page, "turn", f"turned upright  ·  confidence {float(conf):.2f}"
+        return page, "dim", f"already upright  ·  confidence {float(conf):.2f}"
+    if "Too few characters" in line:
+        return "", "warn", "too little text to tell which way up it is - left alone"
+    if re.search(r"\b(ERROR|CRITICAL|Error during processing)\b", line):
+        return "", "bad", line.strip()
+    return None
 
-    Progress is counted in pages, not files, so a single long document still
-    moves the bar. Each page costs one unit to straighten and one to read.
-    """
+
+def note_prerotate(msg: str, row: dict) -> None:
+    """Turn one prerotate report line into a coloured record row."""
+    STATE["units_done"] += 1
+    m = PRE_LINE.search(msg)
+    if not m:
+        return log(msg.strip())
+    page, what, deg, why = m.group(1), m.group(2), m.group(3), m.group(4)
+    row["page"] = int(page)
+    if deg:
+        log(f"turned {deg}° clockwise  ·  {why}", "turn", page)
+    elif what.startswith("left upright"):
+        log(f"already upright  ·  {why}", "dim", page)
+    else:
+        log("too little text to tell which way up it is - left alone", "warn", page)
+
+
+def run_batch(opts: dict) -> None:
+    """Worker thread: OCR every uploaded document, streaming into LOG."""
     per_page = 2 if opts.get("rotate") else 1
-    counts = {src: page_count(src) for src in UPLOADS}
-    STATE.update(running=True, done=False, units_done=0, started=time.time(),
-                 units_total=max(1, sum(n * per_page for n in counts.values())))
+    FILES.clear()
+    for src in UPLOADS:
+        FILES.append({"name": src.name, "pages": page_count(src), "page": 0, "state": "queued"})
+    STATE.update(running=True, done=False, cancel=False, units_done=0, started=time.time(),
+                 units_total=max(1, sum(f["pages"] * per_page for f in FILES)))
     ok = fail = 0
     try:
-        for i, src in enumerate(UPLOADS, 1):
-            pages = counts[src]
+        for i, src in enumerate(UPLOADS):
+            row = FILES[i]
+            if STATE["cancel"]:
+                row["state"] = "cancelled"
+                continue
+            pages = row["pages"]
+            row["state"] = "running"
             dst = src.parent / f"{src.stem}_ocr.pdf"
-            log(f"[{i}/{len(UPLOADS)}] {src.name}  ({pages} page{'s' if pages != 1 else ''})")
+            log(f"{src.name}  ·  {pages} page{'s' if pages != 1 else ''}", "head")
             ocr_src = src
             if opts.get("rotate"):
-                STATE["stage"] = f"{src.name} - checking which way up each page is"
-                log("   checking which way up each page is...")
+                STATE["stage"] = f"{src.name} — checking page orientation"
                 try:
                     upright = src.parent / f"{src.stem}_upright.pdf"
-
-                    def note(msg: str) -> None:
-                        log(msg)
-                        STATE["units_done"] += 1
-
-                    prerotate(src, upright, opts.get("lang", "eng").split("+")[0], report=note)
+                    prerotate(src, upright, opts.get("lang", "eng").split("+")[0],
+                              report=lambda m: note_prerotate(m, row))
                     ocr_src = upright
                 except Exception as exc:
-                    log(f"   could not pre-rotate ({exc!r}); reading pages as they are")
+                    log(f"could not pre-rotate ({exc!r}); reading pages as they are", "warn")
                     STATE["units_done"] += pages
+            if STATE["cancel"]:
+                row["state"] = "cancelled"
+                break
 
-            STATE["stage"] = f"{src.name} - reading the text"
-            base = STATE["units_done"]
-            seen = 0
+            STATE["stage"] = f"{src.name} — reading the text"
+            base, seen = STATE["units_done"], 0
             p = subprocess.Popen(ocr_cmd(ocr_src, dst, opts), stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  errors="replace", env=child_env(),
                                  creationflags=CREATE_NO_WINDOW)
+            STATE["proc"] = p
             for line in p.stdout:
                 if JUNK.search(line):
                     continue
                 m = PAGE_NO.match(line)
                 if m:
                     seen = max(seen, min(int(m.group(1)), pages))
+                    row["page"] = seen
                     STATE["units_done"] = base + seen
-                    STATE["stage"] = (f"{src.name} - finishing the last pages"
-                                      if seen >= pages else
-                                      f"{src.name} - reading page {seen} of {pages}")
+                    STATE["stage"] = (f"{src.name} — finishing the last pages" if seen >= pages
+                                      else f"{src.name} — reading page {seen} of {pages}")
                 if opts.get("verbose"):
                     if not CHATTER.match(line):
-                        log("   " + line)
+                        g = m.group(1) if m else ""
+                        log(re.sub(r"^\s*\d+\s+", "", line).strip(), "dim", g)
                 else:
-                    nice = friendly(line)
-                    if nice:
-                        log(nice)
+                    row_out = classify(line)
+                    if row_out:
+                        log(row_out[2], row_out[1], row_out[0])
+            code = p.wait()
+            STATE["proc"] = None
             STATE["units_done"] = base + pages
-            if p.wait() == 0 and dst.exists():
+            if STATE["cancel"]:
+                row["state"] = "cancelled"
+                log("run cancelled - your files and settings are unchanged", "warn")
+                break
+            if code == 0 and dst.exists():
                 ok += 1
+                row.update(state="done", page=pages)
                 RESULTS[uuid.uuid4().hex] = dst
-                log(f"   done -> {dst.name}  ({dst.stat().st_size // 1024} KB)\n")
+                log(f"{dst.name}  ·  {dst.stat().st_size // 1024} KB", "ok")
             else:
                 fail += 1
-                log(f"   FAILED (exit code {p.returncode})\n")
-        log(f"Finished. {ok} succeeded, {fail} failed.")
-        if ok:
-            log("Press Save to folder, or use the download links.")
+                row["state"] = "failed"
+                log(f"failed, exit code {code}", "bad")
+        for row in FILES:
+            if row["state"] == "queued":
+                row["state"] = "cancelled" if STATE["cancel"] else row["state"]
+        if STATE["cancel"]:
+            log("Cancelled.", "head")
+        else:
+            log(f"Finished  ·  {ok} succeeded, {fail} failed", "head")
     except Exception as exc:                       # never leave the UI hanging
-        log(f"Unexpected error: {exc!r}")
+        log(f"unexpected error: {exc!r}", "bad")
     finally:
-        STATE.update(running=False, done=True, stage="")
+        STATE.update(running=False, done=True, stage="", proc=None)
 
 
 PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
-<title>OCRmyPDF Portable</title>
+<title>Document OCR</title>
 <style>
+:root{
+  --paper:#EFF2F5; --surface:#FFFFFF; --sunk:#E4E9EE;
+  --ink:#15202B; --muted:#5B6B7B; --faint:#8695A4;
+  --line:#D5DCE4; --line-strong:#B6C1CC;
+  --accent:#14557A; --accent-ink:#FFFFFF; --accent-soft:#DDE9F1;
+  --ok:#1B6B47; --warn:#8A5A00; --warn-soft:#FBF0DC; --bad:#A32B21;
+  --term-bg:#111A22; --term-ink:#C6D2DC; --term-dim:#6E8090;
+  --term-cyan:#5FB3D4; --term-green:#7FB77E; --term-amber:#D9A441; --term-red:#D4776C;
+  --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",monospace;
+  --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
+}
+/* Deliberately light-only: this runs on office PCs whose theme setting varies,
+   and the record panel is the one dark surface by design. Every colour below is
+   painted explicitly so the page never borrows the browser's dark ground. */
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#eceff3;--card:#fff;--line:#dde2e9;--ink:#1a1f27;--dim:#69727e;
-      --accent:#1266c7;--accent-dark:#0d4f9e;--ok:#14733a;--bad:#b3261e}
-body{font:15px/1.6 "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--ink);
-     padding:26px 18px 70px}
-main{max-width:840px;margin:0 auto}
-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:22px}
-h1{font-size:23px;font-weight:650;letter-spacing:-.2px}
-.sub{color:var(--dim);font-size:14px;margin-top:3px}
-#langtoggle{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fff;flex:none}
-#langtoggle button{border:0;background:#fff;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;color:var(--dim)}
-#langtoggle button.on{background:var(--accent);color:#fff}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:14px}
-.card>h2{font-size:13px;font-weight:650;color:var(--dim);margin-bottom:14px;
-         display:flex;align-items:center;gap:10px}
-.num{width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;flex:none;
-     display:grid;place-items:center;font-size:12px;font-weight:700}
-#drop{border:2px dashed #b8c4d4;border-radius:10px;padding:30px 16px;text-align:center;
-      color:var(--dim);cursor:pointer;transition:.15s;background:#fafbfd;font-size:14px}
-#drop.hot{border-color:var(--accent);background:#e9f1fc;color:var(--accent)}
-#list{list-style:none;margin-top:12px;max-height:150px;overflow:auto}
-#list li{display:flex;justify-content:space-between;gap:12px;padding:6px 9px;border-radius:6px;font-size:13.5px}
-#list li:nth-child(odd){background:#f5f7fa}
-#list span{color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
-.opt{display:flex;align-items:center;gap:9px;padding:7px 0;font-size:14.5px}
-.opt input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);flex:none}
-select{font:inherit;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:#fff;min-width:230px}
-.i{width:19px;height:19px;border-radius:50%;border:1px solid #b8c4d4;background:#fff;color:var(--dim);
-   font:600 12px/1 serif;cursor:pointer;flex:none;display:grid;place-items:center}
-.i:hover{border-color:var(--accent);color:var(--accent)}
-.info{display:none;font-size:13.2px;color:var(--dim);background:#f5f7fa;border-inline-start:3px solid #c9d4e2;
-      padding:9px 12px;border-radius:0 7px 7px 0;margin:2px 0 8px}
-.info.show{display:block}
-button.act{font:inherit;padding:10px 20px;border-radius:8px;border:1px solid var(--line);
-           background:#fff;cursor:pointer}
-button.act:hover:not(:disabled){border-color:#93a5ba}
-button.primary{background:var(--accent);border-color:var(--accent-dark);color:#fff;font-weight:600;padding:12px 32px}
-button:disabled{opacity:.45;cursor:default}
-.row{display:flex;gap:11px;align-items:center;flex-wrap:wrap}
-.bar{height:6px;background:#e0e5ea;border-radius:3px;overflow:hidden;margin:15px 0 0}
-.bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
-#log{background:#12171e;color:#d5dce5;font:12.5px/1.6 ui-monospace,Consolas,monospace;padding:15px;
-     border-radius:9px;height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;
-     margin-top:14px;direction:ltr;text-align:left}
-a.dl{display:inline-block;margin:7px 8px 0 0;padding:8px 14px;background:#e9f1fc;border:1px solid #bcd4ef;
-     border-radius:8px;text-decoration:none;color:var(--accent-dark);font-size:14px}
-.ok{color:var(--ok);font-weight:600} .bad{color:var(--bad)}
-#stage{margin-top:7px;font-size:13px;min-height:19px;direction:ltr;text-align:start}
-[dir=rtl] .info{border-radius:7px 0 0 7px}
-[dir=rtl] #log{direction:ltr;text-align:left}
+body{background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans)}
+.shell{max-width:1240px;margin:0 auto;padding:22px 18px 60px}
+.mock{background:var(--surface);border:1px solid var(--line)}
+.appbar{display:flex;align-items:center;justify-content:space-between;gap:16px;
+        padding:14px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:10px}
+.brand .name{font:600 15px/1 var(--sans);letter-spacing:-.01em}
+.brand .tag{font:500 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+.barright{display:flex;gap:10px;align-items:center}
+.langsw{display:flex;border:1px solid var(--line-strong)}
+.langsw button{font:600 11px/1 var(--mono);padding:7px 11px;color:var(--muted);
+               background:var(--surface);border:0;cursor:pointer}
+.langsw button.on{background:var(--accent);color:var(--accent-ink)}
+.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.panel{padding:18px}
+.panel+.panel{border-top:1px solid var(--line)}
+.plabel{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.plabel i{flex:1;height:1px;background:var(--line);font-style:normal}
+.chip{font:600 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+      padding:4px 7px;background:var(--sunk);color:var(--muted);white-space:nowrap}
+.chip.ok{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
+.chip.run{background:var(--accent-soft);color:var(--accent)}
+.chip.wait{background:var(--sunk);color:var(--faint)}
+.chip.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+#drop{border:1.5px dashed var(--line-strong);background:var(--sunk);padding:22px;
+      text-align:center;color:var(--muted);font-size:13.5px;cursor:pointer}
+#drop.hot{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+#drop b{display:block;color:var(--ink);font-weight:600;font-size:14.5px;margin-bottom:3px}
+#drop.hot b{color:var(--accent)}
+#queue{list-style:none;margin-top:12px;border:1px solid var(--line)}
+#queue:empty{display:none}
+#queue li{display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:center;
+          padding:8px 11px;font-size:13.5px;border-bottom:1px solid var(--line)}
+#queue li:last-child{border-bottom:0}
+#queue .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#queue .sz{font:500 12px/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
+label.opt{display:flex;align-items:center;gap:9px;font-size:14px;padding:5px 0;cursor:pointer}
+input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent)}
+select,input[type=text]{font:inherit;font-size:13.5px;padding:7px 10px;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink)}
+.field{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.warnbox{display:flex;gap:10px;background:var(--warn-soft);border-left:3px solid var(--warn);
+         padding:10px 12px;font-size:13px;margin:2px 0 12px}
+.warnbox .k{font:600 10px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+            color:var(--warn);white-space:nowrap}
+.hint{font-size:12.5px;color:var(--faint);margin:-2px 0 8px 24px}
+.btn{font:600 13px/1 var(--sans);padding:11px 18px;border:1px solid var(--line-strong);
+     background:var(--surface);color:var(--ink);cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn.danger{border-color:var(--bad);color:var(--bad);background:transparent}
+.btn:disabled{opacity:.45;cursor:default}
+.btn:focus-visible,.langsw button:focus-visible,#drop:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.meter{height:4px;background:var(--sunk);overflow:hidden;margin:14px 0 8px}
+.meter i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+.status{display:flex;justify-content:space-between;gap:12px;font:500 12px/1.4 var(--mono);
+        color:var(--muted);direction:ltr}
+.status .eta{font-variant-numeric:tabular-nums;color:var(--faint);white-space:nowrap}
+.term{background:var(--term-bg);color:var(--term-ink);font:12.5px/1.65 var(--mono);
+      display:flex;flex-direction:column;min-height:0}
+.term .head{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;
+  border-bottom:1px solid rgba(255,255,255,.09);color:var(--term-dim);
+  font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.term .body{padding:10px 0;overflow:auto;flex:1;direction:ltr;text-align:left;min-height:260px}
+.ln{display:grid;grid-template-columns:34px 1fr;gap:10px;padding:1px 12px}
+.ln .g{color:var(--term-dim);text-align:right;font-variant-numeric:tabular-nums;user-select:none}
+.k-dim{color:var(--term-dim)} .k-turn{color:var(--term-cyan)} .k-ok{color:var(--term-green)}
+.k-warn{color:var(--term-amber)} .k-bad{color:var(--term-red)}
+.k-head{color:var(--term-ink);font-weight:600}
+.ln.k-head-row{margin-top:9px;padding-top:5px;border-top:1px solid rgba(255,255,255,.08)}
+.dlwrap{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+a.dl{display:inline-block;padding:7px 12px;background:var(--accent-soft);
+     border:1px solid var(--accent);text-decoration:none;color:var(--accent);font-size:13px}
+.ok-t{color:var(--ok);font-weight:600} .bad-t{color:var(--bad)}
+.split{display:grid}
+@media(min-width:900px){
+  .split{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr)}
+  .split>.right{border-left:1px solid var(--line);border-top:0}
+}
+.split>.right{border-top:1px solid var(--line);display:flex;flex-direction:column}
+[dir=rtl] .warnbox{border-left:0;border-right:3px solid var(--warn)}
+[dir=rtl] .hint{margin:-2px 24px 8px 0}
 </style>
-<main>
-<header>
-  <div><h1 data-t=title></h1><p class=sub data-t=sub></p></div>
-  <div id=langtoggle><button id=btn-en class=on>English</button><button id=btn-ar>عربي</button></div>
-</header>
-
-<div class=card><h2><span class=num>1</span><span data-t=s1></span></h2>
-  <div id=drop data-t=drop></div>
-  <input type=file id=picker accept=application/pdf multiple hidden>
-  <ul id=list></ul>
-  <div class=row style=margin-top:10px><button class=act id=clear data-t=clear></button><span id=count class=sub></span></div>
-</div>
-
-<div class=card><h2><span class=num>2</span><span data-t=s2></span></h2>
-  <div class=row><button class=act id=pick data-t=choose></button><span id=dest data-t=nodir></span></div>
-  <div id=pathbox style="margin-top:11px;display:none">
-    <input type=text id=path style="font:inherit;padding:9px 11px;border:1px solid var(--line);border-radius:8px;width:100%">
-    <p class="info show" data-t=pathhint></p>
+<div class=shell><div class=mock>
+<div class=appbar>
+  <div class=brand><span class=name data-t=title></span><span class=tag data-t=tag></span></div>
+  <div class=barright>
+    <span class=chip id=summary hidden></span>
+    <div class=langsw><button id=btn-en class=on>EN</button><button id=btn-ar>عربي</button></div>
   </div>
 </div>
-
-<div class=card><h2><span class=num>3</span><span data-t=s3></span></h2>
-  <div class=row style=margin-bottom:4px>
-    <span data-t=doclang></span>
-    <select id=lang>
-      <option value=eng data-t=l_eng></option>
-      <option value=eng+ara data-t=l_both></option>
-      <option value=ara data-t=l_ara></option>
-    </select>
-    <button class=i data-info=i_lang>i</button>
+<div class=split>
+  <div class=left>
+    <div class=panel>
+      <div class=plabel><span class=eyebrow data-t=s_docs></span><i></i>
+        <button class=btn id=clear style="padding:5px 10px;font-size:12px" data-t=clear></button></div>
+      <div id=drop tabindex=0><b data-t=drop1></b><span data-t=drop2></span></div>
+      <input type=file id=picker accept=application/pdf multiple hidden>
+      <ul id=queue></ul>
+    </div>
+    <div class=panel>
+      <div class=plabel><span class=eyebrow data-t=s_dest></span><i></i></div>
+      <div class=actions><button class=btn id=pick data-t=choose></button>
+        <span id=dest class=status style="display:block" data-t=nodir></span></div>
+      <div id=pathbox hidden style=margin-top:10px>
+        <input type=text id=path style=width:100%>
+        <p class=hint style=margin-left:0 data-t=pathhint></p>
+      </div>
+    </div>
+    <div class=panel>
+      <div class=plabel><span class=eyebrow data-t=s_set></span><i></i></div>
+      <div class=field><label for=lang style=font-size:14px data-t=doclang></label>
+        <select id=lang>
+          <option value=eng data-t=l_eng></option>
+          <option value=eng+ara data-t=l_both></option>
+          <option value=ara data-t=l_ara></option>
+        </select></div>
+      <div class=warnbox id=langwarn hidden>
+        <span class=k data-t=w_key></span><span data-t=w_body></span></div>
+      <label class=opt><input type=checkbox id=rotate checked><span data-t=o_rotate></span></label>
+      <p class=hint data-t=h_rotate></p>
+      <label class=opt><input type=checkbox id=redo><span data-t=o_redo></span></label>
+      <p class=hint data-t=h_redo></p>
+      <label class=opt><input type=checkbox id=verbose checked><span data-t=o_verbose></span></label>
+    </div>
+    <div class=panel>
+      <div class=actions>
+        <button class="btn primary" id=go disabled data-t=start></button>
+        <button class="btn danger" id=cancel hidden data-t=cancel></button>
+        <button class=btn id=save disabled data-t=save></button>
+      </div>
+      <div class=meter><i id=prog></i></div>
+      <div class=status><span id=stage></span><span class=eta id=eta></span></div>
+      <div class=dlwrap id=dl></div>
+      <div id=savemsg class=status style=margin-top:8px></div>
+    </div>
   </div>
-  <p class=info id=i_lang data-t=t_lang></p>
-
-  <div class=opt><input type=checkbox id=rotate checked><label for=rotate data-t=o_rotate></label>
-    <button class=i data-info=i_rotate>i</button></div>
-  <p class=info id=i_rotate data-t=t_rotate></p>
-
-  <div class=opt><input type=checkbox id=redo><label for=redo data-t=o_redo></label>
-    <button class=i data-info=i_redo>i</button></div>
-  <p class=info id=i_redo data-t=t_redo></p>
-
-  <div class=opt><input type=checkbox id=deskew><label for=deskew data-t=o_deskew></label>
-    <button class=i data-info=i_deskew>i</button></div>
-  <p class=info id=i_deskew data-t=t_deskew></p>
-
-  <div class=opt><input type=checkbox id=verbose checked><label for=verbose data-t=o_verbose></label>
-    <button class=i data-info=i_verbose>i</button></div>
-  <p class=info id=i_verbose data-t=t_verbose></p>
-</div>
-
-<div class=card><h2><span class=num>4</span><span data-t=s4></span></h2>
-  <div class=row>
-    <button id=go class="act primary" data-t=start disabled></button>
-    <button id=save class=act data-t=save disabled></button><span id=savemsg></span>
+  <div class=right>
+    <div class=panel style="border-bottom:1px solid var(--line);padding-bottom:12px">
+      <div class=plabel style=margin-bottom:0><span class=eyebrow data-t=s_rec></span><i></i>
+        <span class=chip id=reclive hidden data-t=live></span></div>
+    </div>
+    <div class=term style=flex:1>
+      <div class=head><span id=termfile data-t=idle></span><span id=termcount></span></div>
+      <div class=body id=log></div>
+    </div>
   </div>
-  <div class=bar><i id=prog></i></div>
-  <p class=sub id=stage></p>
-  <div id=dl></div>
-  <div id=log></div>
-</div>
-</main>
+</div></div></div>
 <script>
 const STR={
- en:{title:"OCRmyPDF Portable",
-     sub:"Adds an invisible, searchable text layer to scanned PDFs. Every file stays on this PC.",
-     s1:"Add PDFs", drop:"Drop PDF files here, or click to browse",
-     s2:"Where to save the results", choose:"Choose folder…", nodir:"No folder chosen.",
-     pathhint:"Paste a folder path from Explorer's address bar, then press Tab.",
-     s3:"Options", doclang:"Document language:",
-     l_eng:"English", l_both:"English + Arabic", l_ara:"Arabic only",
-     t_lang:"English is fastest and most accurate. Choose English + Arabic when one document mixes both — each page is read in both scripts, which is slower and slightly less accurate on English-only pages. Arabic accuracy on scans is lower than English in all cases.",
-     o_rotate:"Auto-rotate pages",
-     t_rotate:"Detects pages scanned sideways or upside down and turns them upright before reading them.",
-     o_redo:"Redo OCR (replace existing text layer)",
-     t_redo:"Use when the PDF already has a text layer that is wrong. The old one is discarded and rebuilt. Leave this off for plain scans, where pages that already contain real text are skipped untouched.",
-     o_deskew:"Deskew crooked scans",
-     t_deskew:"Straightens pages that went through the scanner at a slight angle of 1 to 3 degrees. Improves reading accuracy, but the page image is re-rendered rather than kept exactly as scanned. Cannot be combined with Redo OCR.",
-     o_verbose:"Detailed log",
-     t_verbose:"Shows every internal step instead of a short summary. Useful only when something goes wrong.",
-     s4:"Run", start:"Start OCR", save:"Save to folder", clear:"Clear list",
-     nfiles:n=>`${n} file(s) ready`, left:t=>`about ${t} left`,
-     ready:"Ready. Add some PDFs to begin.", saving:"Saving…",
-     saved:n=>`Saved ${n} file(s)`, nofiles:"Add at least one PDF first.",
-     notfound:"Folder not found"},
- ar:{title:"OCRmyPDF المحمول",
-     sub:"يضيف طبقة نص غير مرئية قابلة للبحث إلى ملفات PDF الممسوحة ضوئيًا. تبقى جميع الملفات على هذا الجهاز.",
-     s1:"إضافة ملفات PDF", drop:"أفلت ملفات PDF هنا، أو انقر للاختيار",
-     s2:"مكان حفظ النتائج", choose:"اختيار مجلد…", nodir:"لم يتم اختيار مجلد.",
-     pathhint:"الصق مسار المجلد من شريط العنوان في مستكشف الملفات، ثم اضغط Tab.",
-     s3:"الخيارات", doclang:"لغة المستند:",
-     l_eng:"الإنجليزية", l_both:"الإنجليزية والعربية", l_ara:"العربية فقط",
-     t_lang:"الإنجليزية هي الأسرع والأدق. اختر «الإنجليزية والعربية» عندما يجمع المستند الواحد بين اللغتين، إذ تُقرأ كل صفحة بالنظامين معًا، وهو أبطأ وأقل دقة قليلًا في الصفحات الإنجليزية وحدها. دقة التعرف على العربية في المستندات الممسوحة أقل من الإنجليزية في جميع الأحوال.",
-     o_rotate:"تدوير الصفحات تلقائيًا",
-     t_rotate:"يكتشف الصفحات الممسوحة بشكل جانبي أو المقلوبة ويعيدها إلى وضعها الصحيح قبل قراءتها.",
-     o_redo:"إعادة التعرف الضوئي (استبدال طبقة النص الحالية)",
-     t_redo:"استخدم هذا الخيار عندما يحتوي الملف على طبقة نص خاطئة، إذ تُحذف الطبقة القديمة وتُنشأ طبقة جديدة. اترك الخيار غير محدد للمستندات الممسوحة العادية، حيث تُترك الصفحات التي تحتوي على نص حقيقي كما هي.",
-     o_deskew:"تصحيح ميلان الصفحات",
-     t_deskew:"يصحح الصفحات التي مرت في الماسح الضوئي بزاوية مائلة بين درجة وثلاث درجات. يحسّن دقة القراءة، لكن تُعاد معالجة صورة الصفحة بدلًا من الاحتفاظ بها كما مُسحت. لا يمكن الجمع بينه وبين إعادة التعرف الضوئي.",
-     o_verbose:"سجل تفصيلي",
-     t_verbose:"يعرض كل خطوة داخلية بدلًا من ملخص مختصر. مفيد فقط عند حدوث مشكلة.",
-     s4:"التشغيل", start:"بدء المعالجة", save:"حفظ في المجلد", clear:"مسح القائمة",
-     nfiles:n=>`${n} ملف جاهز`, left:t=>`يتبقى نحو ${t}`,
-     saving:"جارٍ الحفظ…",   /* the log itself stays English in both languages */
-     saved:n=>`تم حفظ ${n} ملف`, nofiles:"أضف ملف PDF واحدًا على الأقل.",
-     notfound:"المجلد غير موجود"}};
+ en:{title:"Document OCR", tag:"Scanned PDF → searchable",
+  s_docs:"Documents", clear:"Clear", drop1:"Drop PDFs here",
+  drop2:"or click to browse — originals are never changed",
+  s_dest:"Destination", choose:"Choose folder…", nodir:"No folder chosen",
+  pathhint:"Paste a folder path from Explorer's address bar, then press Tab.",
+  s_set:"Settings", doclang:"Document language",
+  l_eng:"English", l_both:"English + Arabic", l_ara:"Arabic",
+  w_key:"Slower", w_body:"Every page is read twice, once per script. Arabic on scans is read less accurately than English.",
+  o_rotate:"Auto-rotate pages", h_rotate:"Turns sideways and upside-down scans upright before reading them",
+  o_redo:"Redo OCR (replace existing text layer)",
+  h_redo:"For files another tool already OCR'd badly. Off means pages that already hold real text are skipped untouched",
+  o_verbose:"Detailed record",
+  s_rec:"Record", live:"live", idle:"No run yet",
+  start:"Start OCR", cancel:"Cancel run", save:"Save to folder",
+  running:"Running…", left:t=>`about ${t} left`,
+  q_done:"done", q_run:p=>`page ${p}`, q_wait:"queued", q_fail:"failed", q_cancel:"cancelled",
+  sum:(d,t,p)=>`${d} of ${t} documents · ${p} pages`,
+  saved:n=>`Saved ${n} file(s)`, saving:"Saving…", notfound:"Folder not found",
+  nfiles:(f,p)=>`${f} document(s) · ${p} pages`},
+ ar:{title:"التعرّف الضوئي على المستندات", tag:"ملف ممسوح ← قابل للبحث",
+  s_docs:"المستندات", clear:"مسح", drop1:"أفلت ملفات PDF هنا",
+  drop2:"أو انقر للاختيار — لا تُعدَّل الملفات الأصلية",
+  s_dest:"مكان الحفظ", choose:"اختيار مجلد…", nodir:"لم يتم اختيار مجلد",
+  pathhint:"الصق مسار المجلد من شريط العنوان في مستكشف الملفات، ثم اضغط Tab.",
+  s_set:"الإعدادات", doclang:"لغة المستند",
+  l_eng:"الإنجليزية", l_both:"الإنجليزية والعربية", l_ara:"العربية",
+  w_key:"أبطأ", w_body:"تُقرأ كل صفحة مرتين، مرة لكل نظام كتابة. ودقة التعرّف على العربية في المستندات الممسوحة أقل من الإنجليزية.",
+  o_rotate:"تدوير الصفحات تلقائيًا", h_rotate:"يعيد الصفحات الجانبية والمقلوبة إلى وضعها الصحيح قبل قراءتها",
+  o_redo:"إعادة التعرّف الضوئي (استبدال طبقة النص الحالية)",
+  h_redo:"للملفات التي عالجها برنامج آخر بشكل خاطئ. عند إيقافه تُترك الصفحات التي تحتوي نصًا حقيقيًا كما هي",
+  o_verbose:"سجل تفصيلي",
+  s_rec:"السجل", live:"مباشر", idle:"لا توجد عملية بعد",
+  start:"بدء المعالجة", cancel:"إلغاء العملية", save:"حفظ في المجلد",
+  running:"جارٍ التنفيذ…", left:t=>`يتبقى نحو ${t}`,
+  q_done:"تم", q_run:p=>`صفحة ${p}`, q_wait:"في الانتظار", q_fail:"فشل", q_cancel:"أُلغيت",
+  sum:(d,t,p)=>`${d} من ${t} مستندات · ${p} صفحة`,
+  saved:n=>`تم حفظ ${n} ملف`, saving:"جارٍ الحفظ…", notfound:"المجلد غير موجود",
+  nfiles:(f,p)=>`${f} مستند · ${p} صفحة`}};
 
 const T=new URLSearchParams(location.search).get('t');
 const $=id=>document.getElementById(id);
@@ -348,21 +422,23 @@ let L='en', files=[], dirHandle=null, since=0, poll=null, results=[];
 function apply(lang){
   L=lang; const s=STR[lang];
   document.documentElement.lang=lang;
-  document.documentElement.dir = lang==='ar' ? 'rtl' : 'ltr';
+  document.documentElement.dir=lang==='ar'?'rtl':'ltr';
   document.querySelectorAll('[data-t]').forEach(el=>{
     const v=s[el.dataset.t]; if(typeof v==='string') el.textContent=v;});
-  $('btn-en').className = lang==='en'?'on':'';
-  $('btn-ar').className = lang==='ar'?'on':'';
-  if(!$('log').textContent.trim()||$('log').dataset.idle) {
-    $('log').textContent=STR.en.ready; $('log').dataset.idle='1';}
-  if(!dirHandle && !$('dest').dataset.set) $('dest').textContent=s.nodir;
+  $('btn-en').className=lang==='en'?'on':''; $('btn-ar').className=lang==='ar'?'on':'';
+  if(!dirHandle && $('dest').dataset.set!=='1') $('dest').textContent=s.nodir;
+  langWarn(); paintQueue();
 }
 $('btn-en').onclick=()=>apply('en'); $('btn-ar').onclick=()=>apply('ar');
-document.querySelectorAll('.i').forEach(b=>b.onclick=()=>$(b.dataset.info).classList.toggle('show'));
 
-/* 1. files */
+/* the warning appears on its own when both scripts are chosen */
+function langWarn(){ $('langwarn').hidden = $('lang').value!=='eng+ara'; }
+$('lang').onchange=langWarn;
+
+/* --- documents --- */
 const drop=$('drop');
 drop.onclick=()=>$('picker').click();
+drop.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('picker').click()}};
 $('picker').onchange=e=>add([...e.target.files]);
 ['dragenter','dragover'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add('hot')}));
 ['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('hot')}));
@@ -370,78 +446,112 @@ drop.addEventListener('drop',e=>add([...e.dataTransfer.files]));
 function add(fs){
   fs=fs.filter(f=>f.name.toLowerCase().endsWith('.pdf'));
   for(const f of fs) if(!files.some(x=>x.name===f.name&&x.size===f.size)) files.push(f);
-  $('list').innerHTML=files.map(f=>
-    `<li><b>${f.name}</b><span>${(f.size/1048576).toFixed(1)} MB</span></li>`).join('');
-  refresh();
+  paintQueue(); refresh();
 }
 $('clear').onclick=async()=>{
-  files=[]; results=[]; $('list').innerHTML=''; $('dl').innerHTML='';
-  $('savemsg').textContent=''; $('picker').value='';
-  $('log').textContent=STR.en.ready; $('log').dataset.idle='1';
-  $('prog').style.width='0'; $('save').disabled=true;
-  await fetch(`/reset?t=${T}`,{method:'POST'});
-  refresh();
+  files=[]; results=[]; serverFiles=[]; $('dl').innerHTML=''; $('savemsg').textContent='';
+  $('log').innerHTML=''; $('picker').value=''; $('prog').style.width='0';
+  $('stage').textContent=''; $('eta').textContent=''; $('save').disabled=true;
+  $('summary').hidden=true; $('reclive').hidden=true; $('termfile').textContent=STR[L].idle;
+  $('termcount').textContent='';
+  await fetch(`/reset?t=${T}`,{method:'POST'}); paintQueue(); refresh();
 };
 
-/* 2. destination */
+let serverFiles=[];
+function paintQueue(){
+  const s=STR[L];
+  const rows = serverFiles.length ? serverFiles : files.map(f=>({name:f.name,size:f.size}));
+  $('queue').innerHTML = rows.map(r=>{
+    let cls='wait', txt=s.q_wait;
+    if(r.state==='running'){cls='run'; txt=s.q_run(`${r.page}/${r.pages}`);}
+    else if(r.state==='done'){cls='ok'; txt=s.q_done;}
+    else if(r.state==='failed'){cls='bad'; txt=s.q_fail;}
+    else if(r.state==='cancelled'){cls='wait'; txt=s.q_cancel;}
+    else if(!r.state){cls='wait'; txt=(r.size/1048576).toFixed(1)+' MB';}
+    const meta = r.pages ? `${r.pages} pp` : '';
+    return `<li><span class=nm>${r.name}</span><span class=sz>${meta}</span>`+
+           `<span class="chip ${cls}">${txt}</span></li>`;
+  }).join('');
+}
+
+/* --- destination --- */
 $('pick').onclick=async()=>{
   if(window.showDirectoryPicker){
     try{dirHandle=await showDirectoryPicker({mode:'readwrite'});
-        $('dest').innerHTML='<span class=ok>✓ '+dirHandle.name+'</span>';
-        $('dest').dataset.set='1';}catch(e){}
-  }else{$('pathbox').style.display='block';}
+      $('dest').innerHTML='<span class=ok-t>✓ '+dirHandle.name+'</span>';
+      $('dest').dataset.set='1';}catch(e){}
+  }else{$('pathbox').hidden=false;}
   refresh();
 };
 $('path').onchange=async()=>{
   const j=await (await fetch(`/checkdir?t=${T}&dir=${encodeURIComponent($('path').value)}`)).json();
-  $('dest').innerHTML=j.ok?'<span class=ok>✓ '+j.dir+'</span>'
-                          :'<span class=bad>'+STR[L].notfound+'</span>';
-  $('dest').dataset.set = j.ok ? '1' : '';
-  refresh();
+  $('dest').innerHTML=j.ok?'<span class=ok-t>✓ '+j.dir+'</span>':'<span class=bad-t>'+STR[L].notfound+'</span>';
+  $('dest').dataset.set=j.ok?'1':''; refresh();
 };
 const haveDest=()=>!!dirHandle||$('dest').dataset.set==='1';
-function refresh(){
-  $('go').disabled=!(files.length&&haveDest());
-  $('count').textContent=files.length?STR[L].nfiles(files.length):'';
-}
+function refresh(){$('go').disabled=!(files.length&&haveDest())}
 
-/* 3. run */
+/* --- run --- */
 $('go').onclick=async()=>{
-  $('go').disabled=$('pick').disabled=true; $('save').disabled=true;
-  $('dl').innerHTML=''; $('log').textContent=''; delete $('log').dataset.idle;
-  since=0; results=[]; $('prog').style.width='4%';
+  $('go').disabled=$('pick').disabled=$('clear').disabled=true;
+  $('save').disabled=true; $('cancel').hidden=false;
+  $('go').textContent=STR[L].running;
+  $('dl').innerHTML=''; $('savemsg').textContent=''; $('log').innerHTML='';
+  since=0; results=[]; $('prog').style.width='3%'; $('reclive').hidden=false;
   await fetch(`/reset?t=${T}`,{method:'POST'});
   for(const f of files)
     await fetch(`/upload?t=${T}&name=${encodeURIComponent(f.name)}`,{method:'POST',body:f});
   const q=i=>$(i).checked?1:0;
   await fetch(`/start?t=${T}&lang=${$('lang').value}&rotate=${q('rotate')}`+
-              `&redo=${q('redo')}&deskew=${q('deskew')}&verbose=${q('verbose')}`,{method:'POST'});
+              `&redo=${q('redo')}&verbose=${q('verbose')}`,{method:'POST'});
   poll=setInterval(tick,400);
 };
+$('cancel').onclick=async()=>{
+  $('cancel').disabled=true;
+  await fetch(`/cancel?t=${T}`,{method:'POST'});
+};
+
+function fmt(sec){sec=Math.round(sec);
+  if(sec<60) return sec+'s';
+  const m=Math.round(sec/60); return m+(L==='ar'?' د':(m===1?' min':' mins'));}
+
 async function tick(){
   const j=await (await fetch(`/log?t=${T}&since=${since}`)).json();
   since=j.next;
-  if(j.lines.length){$('log').textContent+=j.lines.join('\n')+'\n';$('log').scrollTop=1e9}
-  $('prog').style.width=Math.max(4,j.progress*100)+'%';
-  $('stage').textContent = j.done ? '' :
-    [j.stage, j.eta ? STR[L].left(fmt(j.eta)) : ''].filter(Boolean).join('  -  ');
+  if(j.lines.length){
+    $('log').insertAdjacentHTML('beforeend', j.lines.map(l=>
+      `<li class="ln k-${l.k}${l.k==='head'?' k-head-row':''}" style=list-style:none>`+
+      `<span class=g>${l.g||''}</span><span>${l.t.replace(/</g,'&lt;')}</span></li>`).join(''));
+    $('log').scrollTop=1e9;
+  }
+  serverFiles=j.files||[]; paintQueue();
+  const running=serverFiles.filter(f=>f.state==='running');
+  const done=serverFiles.filter(f=>f.state==='done').length;
+  const pagesDone=serverFiles.reduce((n,f)=>n+(f.state==='done'?f.pages:f.page),0);
+  if(serverFiles.length){
+    $('summary').hidden=false;
+    $('summary').textContent=STR[L].sum(done,serverFiles.length,pagesDone);
+    $('summary').className='chip '+(j.done?'ok':'run');
+  }
+  if(running.length){
+    $('termfile').textContent=running[0].name;
+    $('termcount').textContent=`${running[0].page} / ${running[0].pages}`;
+  }
+  $('prog').style.width=Math.max(3,j.progress*100)+'%';
+  $('stage').textContent=j.done?'':j.stage;
+  $('eta').textContent=(!j.done&&j.eta)?STR[L].left(fmt(j.eta)):'';
   if(j.done){
-    clearInterval(poll); results=j.results;
+    clearInterval(poll); results=j.results; $('reclive').hidden=true;
     $('dl').innerHTML=results.map(r=>
-      `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">⬇ ${r.name}</a>`).join('');
-    $('go').disabled=$('pick').disabled=false;
-    $('save').disabled=!results.length;
-    $('stage').textContent='';
+      `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">↓ ${r.name}</a>`).join('');
+    $('go').disabled=$('pick').disabled=$('clear').disabled=false;
+    $('go').textContent=STR[L].start;
+    $('cancel').hidden=true; $('cancel').disabled=false;
+    $('save').disabled=!results.length; refresh();
   }
 }
-function fmt(sec){
-  sec=Math.round(sec);
-  if(sec<60) return sec+'s';
-  const m=Math.round(sec/60);
-  return m+(L==='ar'? ' د' : m===1?' min':' mins');
-}
 
-/* 4. save */
+/* --- save --- */
 $('save').onclick=async()=>{
   $('save').disabled=true; $('savemsg').textContent=STR[L].saving;
   try{
@@ -451,14 +561,14 @@ $('save').onclick=async()=>{
         const w=await (await dirHandle.getFileHandle(r.name,{create:true})).createWritable();
         await w.write(blob); await w.close();
       }
-      $('savemsg').innerHTML='<span class=ok>'+STR[L].saved(results.length)+'</span>';
+      $('savemsg').innerHTML='<span class=ok-t>'+STR[L].saved(results.length)+'</span>';
     }else{
       const j=await (await fetch(`/save?t=${T}&dir=${encodeURIComponent($('path').value)}`,
                                  {method:'POST'})).json();
-      $('savemsg').innerHTML=j.ok?'<span class=ok>'+STR[L].saved(j.count)+'</span>'
-                                 :'<span class=bad>'+STR[L].notfound+'</span>';
+      $('savemsg').innerHTML=j.ok?'<span class=ok-t>'+STR[L].saved(j.count)+'</span>'
+                                 :'<span class=bad-t>'+STR[L].notfound+'</span>';
     }
-  }catch(e){$('savemsg').innerHTML='<span class=bad>'+e+'</span>'}
+  }catch(e){$('savemsg').innerHTML='<span class=bad-t>'+e+'</span>'}
   $('save').disabled=false;
 };
 apply('en');
@@ -496,14 +606,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", PAGE.encode())
         elif u.path == "/log":
             done = STATE["done"] and not STATE["running"]
-            # cap at 95% while running: the last stretch is unpredictable, and a bar
-            # that sits at 100% for 20 seconds reads as a hang
             frac = STATE["units_done"] / STATE["units_total"] if STATE["units_total"] else 0
+            # cap at 95% while running: pages finish in parallel, and a bar that sits
+            # at 100% for twenty seconds reads as a hang
             self._json({"lines": LOG[int(q.get("since", ["0"])[0]):], "next": len(LOG),
-                        "done": done,
-                        "progress": 1.0 if done else min(0.95, frac),
-                        "stage": STATE["stage"],
-                        "eta": eta_seconds(),
+                        "done": done, "progress": 1.0 if done else min(0.95, frac),
+                        "stage": STATE["stage"], "eta": eta_seconds(), "files": FILES,
                         "results": [{"id": k, "name": v.name} for k, v in RESULTS.items()]})
         elif u.path == "/checkdir":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
@@ -523,12 +631,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth(q):
             return
         if u.path == "/reset":
-            UPLOADS.clear()
-            RESULTS.clear()
-            LOG.clear()
-            STATE.update(running=False, done=False)
-            return self._json({"ok": True})
-        if u.path == "/upload":
+            UPLOADS.clear(); RESULTS.clear(); LOG.clear(); FILES.clear()
+            STATE.update(running=False, done=False, cancel=False,
+                         units_done=0, units_total=0, stage="")
+            self._json({"ok": True})
+        elif u.path == "/upload":
             name = Path(q.get("name", ["input.pdf"])[0]).name or "input.pdf"
             job = WORK / uuid.uuid4().hex
             job.mkdir()
@@ -539,12 +646,17 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/start":
             if STATE["running"]:
                 return self._json({"ok": False, "error": "already running"})
-            LOG.clear()
-            RESULTS.clear()
-            opts = {k: q.get(k, ["0"])[0] == "1"
-                    for k in ("rotate", "redo", "deskew", "verbose")}
+            LOG.clear(); RESULTS.clear()
+            opts = {k: q.get(k, ["0"])[0] == "1" for k in ("rotate", "redo", "verbose")}
             opts["lang"] = q.get("lang", ["eng"])[0]
             threading.Thread(target=run_batch, args=(opts,), daemon=True).start()
+            self._json({"ok": True})
+        elif u.path == "/cancel":
+            # stop the current page and skip the rest; uploads and settings stay put
+            STATE["cancel"] = True
+            proc = STATE.get("proc")
+            if proc and proc.poll() is None:
+                proc.terminate()
             self._json({"ok": True})
         elif u.path == "/save":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
@@ -565,7 +677,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     url = f"http://127.0.0.1:{srv.server_address[1]}/?t={TOKEN}"
-    print("OCRmyPDF is running. Leave this window open while you work.\n")
+    print("Document OCR is running. Leave this window open while you work.\n")
     print("   ", url, "\n")
     print("If no browser opened, copy that address into Edge.")
     print("Closing this window shuts the tool down.")
@@ -580,45 +692,49 @@ def main():
 
 def selftest():
     """python web_gui.py --selftest -- checks the command builder and the page."""
-    c = ocr_cmd(Path("a.pdf"), Path("b.pdf"), {"rotate": True, "deskew": True, "lang": "eng+ara"})
+    c = ocr_cmd(Path("a.pdf"), Path("b.pdf"), {"lang": "eng+ara"})
     assert c[c.index("-l") + 1] == "eng+ara"
-    assert "--skip-text" in c and "--deskew" in c
-    assert "--rotate-pages" not in c        # prerotate.py does it first instead
-    assert "--output-type" in c and c[c.index("--output-type") + 1] == "pdf"
-    assert c[c.index("--optimize") + 1] == "0"      # silences the jbig2/pngquant probes
-    r = ocr_cmd(Path("a.pdf"), Path("b.pdf"), {"redo": True, "deskew": True})
-    assert "--redo-ocr" in r and "--deskew" not in r          # incompatible pair
+    assert "--skip-text" in c and "--rotate-pages" not in c     # prerotate does it first
+    assert c[c.index("--optimize") + 1] == "0"
+    assert c[c.index("--output-type") + 1] == "pdf"
+    assert "--redo-ocr" in ocr_cmd(Path("a"), Path("b"), {"redo": True})
     assert ocr_cmd(Path("a"), Path("b"), {"lang": "nonsense"})[3:5] == ["-l", "eng"]
+    assert "--deskew" not in " ".join(ocr_cmd(Path("a"), Path("b"), {"deskew": True}))
 
     assert JUNK.search("[WinError 2] The system cannot find the file specified")
-    assert JUNK.search("UnicodeEncodeError: 'charmap' codec can't encode")
-    assert not JUNK.search("    1 page is facing")
     assert CHATTER.match("        1 Running: ['tesseract', '--version']")
-    assert not CHATTER.match("   Postprocessing...")
-
-    nice = friendly("        1 page is facing ⇨, confidence 1.52 - will rotate")
-    assert "on its side" in nice and "turned upright" in nice, nice
-    assert "left as it is" in friendly("   1 page is facing ⇧, confidence 0.00 - no change")
-    assert friendly("   1 [tesseract] Too few characters. Skipping this page")
-    assert friendly("   Postprocessing...") is None
+    g, k, t = classify("        1 page is facing ⇨, confidence 1.52 - will rotate")
+    assert (g, k) == ("1", "turn") and "turned upright" in t
+    assert classify("   1 [tesseract] Too few characters. Skipping this page")[1] == "warn"
+    assert classify("   Postprocessing...") is None
     assert child_env()["PYTHONIOENCODING"] == "utf-8"
 
-    for key in ("title", "o_redo", "t_deskew", "l_both", "doclang"):
-        assert f'{key}:"' in PAGE or f"{key}:" in PAGE, key
-    assert "PDF/A" not in PAGE and "NAPS2" not in PAGE      # both removed on request
-    assert "العربية" in PAGE and "dir=rtl" in PAGE
-    assert PAGE_NO.match("        7 Rasterizing page 7").group(1) == "7"
-    assert not PAGE_NO.match("Postprocessing...")
+    row = {"page": 0}
+    LOG.clear(); STATE["units_done"] = 0
+    note_prerotate("   page 3: turned 270 deg clockwise  (confidence 8.17)", row)
+    assert LOG[-1]["k"] == "turn" and LOG[-1]["g"] == "3" and row["page"] == 3
+    note_prerotate("   page 4: too little text to tell which way up it is - left alone", row)
+    assert LOG[-1]["k"] == "warn"
+    LOG.clear(); STATE["units_done"] = 0
+
     STATE.update(units_done=0, units_total=10, started=time.time(), running=True)
-    assert eta_seconds() is None                     # too early to guess
+    assert eta_seconds() is None                      # too early to guess
     STATE.update(units_done=4, started=time.time() - 8)
-    assert 10 < eta_seconds() < 14                   # 2s per unit, 6 left
+    assert 10 < eta_seconds() < 14                    # 2s per unit, 6 left
     STATE.update(units_done=10, started=time.time() - 20)
-    assert eta_seconds() is not None                 # still ticking in the tail
+    assert eta_seconds() is not None                  # still ticking in the tail
     STATE.update(running=False)
-    assert eta_seconds() is None                     # nothing running, no estimate
+    assert eta_seconds() is None
     STATE.update(units_done=0, units_total=0, started=0.0)
-    print("selftest ok - bilingual browser UI, no desktop toolkit needed")
+
+    for key in ("title", "o_redo", "w_body", "l_both", "q_run"):
+        assert f"{key}:" in PAGE, key
+    assert "PDF/A" not in PAGE and "NAPS2" not in PAGE and "deskew" not in PAGE.lower()
+    assert "العربية" in PAGE and "rtl" in PAGE
+    assert "border-radius" not in PAGE               # square corners throughout
+    assert "prefers-color-scheme" not in PAGE        # light only, by request
+    assert "--paper:#EFF2F5" in PAGE and "background:var(--paper)" in PAGE
+    print("selftest ok - console layout, no desktop toolkit needed")
 
 
 if __name__ == "__main__":
