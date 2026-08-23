@@ -1,3 +1,2 @@
-app/
-*.zip
 __pycache__/
+*.zip
