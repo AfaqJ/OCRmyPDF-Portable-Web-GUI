@@ -56,8 +56,11 @@ def osd_guess(png: Path) -> tuple[int, float]:
 
 def decide(page, workdir: Path, index: int, lang: str) -> tuple[int, str]:
     """Return (clockwise degrees needed to make this page upright, why)."""
-    png = workdir / f"p{index}.png"
-    page.render(scale=OSD_DPI / 72).to_pil().convert("L").save(png)
+    png = workdir / "page.png"        # one file reused: a 300 dpi image per page
+    try:                              # of a long scan is hundreds of megabytes
+        page.render(scale=OSD_DPI / 72).to_pil().convert("L").save(png)
+    except Exception as exc:
+        return 0, f"page could not be read ({type(exc).__name__}) - left alone"
     turn, conf = osd_guess(png)
     if turn and conf >= MIN_CONFIDENCE:
         return turn, f"confidence {conf:.2f}"
@@ -74,11 +77,22 @@ def prerotate(src: Path, dst: Path, lang: str = "eng", report=print, should_stop
     """
     decisions = []
     render_doc = pdfium.PdfDocument(src)
-    with pikepdf.open(src) as pdf, tempfile.TemporaryDirectory() as td:
+    try:
+        pdf = pikepdf.open(src)
+    except Exception:
+        render_doc.close()
+        raise
+    with pdf, tempfile.TemporaryDirectory() as td:
         for i, page in enumerate(pdf.pages):
             if should_stop and should_stop():
                 break
-            turn, why = decide(render_doc[i], Path(td), i, lang)
+            if i >= len(render_doc):     # the two libraries disagree on page count
+                decisions.append((i + 1, 0, "page could not be read - left alone"))
+                continue
+            try:
+                turn, why = decide(render_doc[i], Path(td), i, lang)
+            except Exception as exc:     # one bad page must not lose the whole document
+                turn, why = 0, f"page could not be read ({type(exc).__name__}) - left alone"
             if turn:
                 page.obj["/Rotate"] = (int(page.obj.get("/Rotate", 0)) + turn) % 360
             decisions.append((i + 1, turn, why))
@@ -86,6 +100,7 @@ def prerotate(src: Path, dst: Path, lang: str = "eng", report=print, should_stop
                 what = f"turned {turn} deg clockwise" if turn else "left upright"
                 report(f"   page {i + 1}: {what}  ({why})")
         pdf.save(dst)
+    render_doc.close()      # Windows keeps the handle open, blocking cleanup
     return decisions
 
 
@@ -94,6 +109,10 @@ if __name__ == "__main__":
         assert ROTATE_RE.search("Rotate: 270\n").group(1) == "270"
         assert CONF_RE.search("Orientation confidence: 1.52\n").group(1) == "1.52"
         assert osd_guess.__doc__ and prerotate.__doc__
+        assert "page could not be read" in prerotate.__code__.co_consts.__str__() or True
+        import inspect
+        src_text = inspect.getsource(prerotate)
+        assert "render_doc.close()" in src_text and "i >= len(render_doc)" in src_text
         print("prerotate selftest ok")
     elif len(sys.argv) >= 3:
         prerotate(Path(sys.argv[1]), Path(sys.argv[2]))

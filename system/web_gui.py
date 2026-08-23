@@ -126,15 +126,17 @@ def note_prerotate(msg: str, row: dict) -> None:
 
 def run_batch(opts: dict) -> None:
     """Worker thread: OCR every uploaded document, streaming into LOG."""
-    per_page = 2 if opts.get("rotate") else 1
-    FILES.clear()
-    for src in UPLOADS:
-        FILES.append({"name": src.name, "pages": page_count(src), "page": 0, "state": "queued"})
-    STATE.update(running=True, done=False, cancel=False, units_done=0, started=time.time(),
-                 units_total=max(1, sum(f["pages"] * per_page for f in FILES)))
+    STATE.update(running=True, done=False, cancel=False, units_done=0, started=time.time())
     ok = fail = 0
     try:
-        for i, src in enumerate(UPLOADS):
+        per_page = 2 if opts.get("rotate") else 1
+        FILES.clear()
+        for src in UPLOADS:
+            FILES.append({"name": src.name, "pages": page_count(src), "page": 0, "state": "queued"})
+        STATE["units_total"] = max(1, sum(f["pages"] * per_page for f in FILES))
+        for i, src in enumerate(list(UPLOADS)):
+            if i >= len(FILES):
+                break                      # the list changed underneath us
             row = FILES[i]
             if STATE["cancel"]:
                 row["state"] = "cancelled"
@@ -453,6 +455,8 @@ const STR={
 
 const T=new URLSearchParams(location.search).get('t');
 const $=id=>document.getElementById(id);
+const esc=v=>String(v).replace(/[&<>"']/g,c=>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let L='en', files=[], dirHandle=null, since=0, poll=null, results=[], running=false;
 
 function apply(lang){
@@ -463,7 +467,9 @@ function apply(lang){
     const v=s[el.dataset.t]; if(typeof v==='string') el.textContent=v;});
   $('btn-en').className=lang==='en'?'on':''; $('btn-ar').className=lang==='ar'?'on':'';
   if(!dirHandle && $('dest').dataset.set!=='1') $('dest').textContent=s.nodir;
-  langWarn(); paintQueue();
+  langWarn();
+  setBusy(running);      /* re-labels Start/Cancel in the new language, keeps the lock */
+  setLive(running);
 }
 $('btn-en').onclick=()=>apply('en'); $('btn-ar').onclick=()=>apply('ar');
 
@@ -517,9 +523,9 @@ function paintQueue(){
     else if(r.state==='cancelled'){cls='wait'; txt=s.q_cancel;}
     else if(!r.state){cls='wait'; txt=(r.size/1048576).toFixed(1)+' MB';}
     const meta = r.pages ? `${r.pages} pp` : '';
-    return `<li><span class=nm>${r.name}</span><span class=sz>${meta}</span>`+
+    return `<li><span class=nm>${esc(r.name)}</span><span class=sz>${meta}</span>`+
            `<span class="chip ${cls}">${txt}</span>`+
-           `<button class=rm data-i="${i}" title="${s.remove}" aria-label="${s.remove}: ${r.name}"`+
+           `<button class=rm data-i="${i}" title="${s.remove}" aria-label="${s.remove}: ${esc(r.name)}"`+
            `${running?' hidden':''}>&times;</button></li>`;
   }).join('');
   $('queue').querySelectorAll('.rm').forEach(b=>b.onclick=()=>removeAt(+b.dataset.i));
@@ -549,13 +555,29 @@ function setLive(on){
   c.textContent=on?STR[L].live:STR[L].idlechip;
 }
 const haveDest=()=>!!dirHandle||$('dest').dataset.set==='1';
-function refresh(){$('go').disabled=!(files.length&&haveDest())}
+function refresh(){$('go').disabled=running||!(files.length&&haveDest())}
+
+/* One switch for the whole window, so nothing can be left enabled mid-run:
+   every setting, both file controls and the per-file remove buttons. */
+const LOCKS=['pick','clear','lang','rotate','redo','verbose','path'];
+function setBusy(on){
+  running=on;
+  LOCKS.forEach(id=>{const e=$(id); if(e) e.disabled=on;});
+  $('go').textContent=on?STR[L].running:STR[L].start;
+  $('cancel').hidden=!on;
+  $('cancel').disabled=false;
+  drop.style.pointerEvents=on?'none':'';
+  drop.style.opacity=on?'.5':'';
+  drop.setAttribute('aria-disabled',String(on));
+  drop.tabIndex=on?-1:0;
+  if(on) $('save').disabled=true;
+  paintQueue();                    /* redraws without the remove buttons */
+  refresh();
+}
 
 /* --- run --- */
 $('go').onclick=async()=>{
-  running=true;
-  $('go').disabled=$('pick').disabled=$('clear').disabled=true;
-  drop.setAttribute('aria-disabled','true'); drop.style.opacity='.55';
+  setBusy(true);
   $('save').disabled=true; $('cancel').hidden=false;
   $('go').textContent=STR[L].running;
   $('dl').innerHTML=''; $('savemsg').textContent=''; $('log').innerHTML='';
@@ -564,7 +586,7 @@ $('go').onclick=async()=>{
   for(const f of files)
     await fetch(`/upload?t=${T}&name=${encodeURIComponent(f.name)}`,{method:'POST',body:f});
   const q=i=>$(i).checked?1:0;
-  await fetch(`/start?t=${T}&lang=${$('lang').value}&rotate=${q('rotate')}`+
+  await fetch(`/start?t=${T}&lang=${encodeURIComponent($('lang').value)}&rotate=${q('rotate')}`+
               `&redo=${q('redo')}&verbose=${q('verbose')}`,{method:'POST'});
   poll=setInterval(tick,400);
 };
@@ -573,8 +595,22 @@ $('cancel').onclick=async()=>{
   await fetch(`/cancel?t=${T}`,{method:'POST'});
 };
 
+let pollFails=0;
 async function tick(){
-  const j=await (await fetch(`/log?t=${T}&since=${since}`)).json();
+  let j;
+  try{
+    j=await (await fetch(`/log?t=${T}&since=${since}`)).json();
+    pollFails=0;
+  }catch(e){
+    /* a dropped poll is survivable; a persistently dead server is not, and
+       leaving the window locked with no explanation is the worst outcome */
+    if(++pollFails<5) return;
+    clearInterval(poll); setBusy(false); setLive(false);
+    $('log').insertAdjacentHTML('beforeend',
+      `<li class="ln k-bad" style=list-style:none><span class=g></span><span>`+
+      `lost contact with the tool - close this tab and run START OCR.bat again</span></li>`);
+    return;
+  }
   since=j.next;
   if(j.lines.length){
     $('log').insertAdjacentHTML('beforeend', j.lines.map(l=>
@@ -583,7 +619,7 @@ async function tick(){
     $('log').scrollTop=1e9;
   }
   serverFiles=j.files||[]; paintQueue();
-  const running=serverFiles.filter(f=>f.state==='running');
+  const active=serverFiles.filter(f=>f.state==='running');   /* not `running`: that is the busy flag */
   const done=serverFiles.filter(f=>f.state==='done').length;
   const pagesDone=serverFiles.reduce((n,f)=>n+(f.state==='done'?f.pages:f.page),0);
   if(serverFiles.length){
@@ -591,9 +627,9 @@ async function tick(){
     $('summary').textContent=STR[L].sum(done,serverFiles.length,pagesDone);
     $('summary').className='chip '+(j.done?'ok':'run');
   }
-  if(running.length){
-    $('termfile').textContent=running[0].name;
-    $('termcount').textContent=`${running[0].page} / ${running[0].pages}`;
+  if(active.length){
+    $('termfile').textContent=active[0].name;
+    $('termcount').textContent=`${active[0].page} / ${active[0].pages}`;
   }
   $('prog').style.width=Math.max(3,j.progress*100)+'%';
   $('stage').textContent=j.done?'':j.stage;
@@ -602,13 +638,9 @@ async function tick(){
   if(j.done){
     clearInterval(poll); results=j.results; setLive(false);
     $('dl').innerHTML=results.map(r=>
-      `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">↓ ${r.name}</a>`).join('');
-    running=false;
-    $('go').disabled=$('pick').disabled=$('clear').disabled=false;
-    drop.removeAttribute('aria-disabled'); drop.style.opacity='';
-    $('go').textContent=STR[L].start;
-    $('cancel').hidden=true; $('cancel').disabled=false;
-    $('save').disabled=!results.length; refresh();
+      `<a class=dl download="${esc(r.name)}" href="/result?t=${T}&id=${r.id}">↓ ${esc(r.name)}</a>`).join('');
+    setBusy(false);
+    $('save').disabled=!results.length;
   }
 }
 
@@ -670,10 +702,11 @@ class Handler(BaseHTTPRequestHandler):
             frac = STATE["units_done"] / STATE["units_total"] if STATE["units_total"] else 0
             # cap at 95% while running: pages finish in parallel, and a bar that sits
             # at 100% for twenty seconds reads as a hang
+            snapshot = list(RESULTS.items())   # the worker inserts while we serve
             self._json({"lines": LOG[int(q.get("since", ["0"])[0]):], "next": len(LOG),
                         "done": done, "progress": 1.0 if done else min(0.95, frac),
                         "stage": STATE["stage"], "files": FILES,
-                        "results": [{"id": k, "name": v.name} for k, v in RESULTS.items()]})
+                        "results": [{"id": k, "name": v.name} for k, v in snapshot]})
         elif u.path == "/checkdir":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
             self._json({"ok": d.is_dir(), "dir": str(d)})
@@ -692,6 +725,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth(q):
             return
         if u.path == "/reset":
+            if STATE["running"]:      # a second tab must not clear a live run
+                return self._json({"ok": False, "error": "a run is in progress"})
             UPLOADS.clear(); RESULTS.clear(); LOG.clear(); FILES.clear()
             STATE.update(running=False, done=False, cancel=False,
                          units_done=0, units_total=0, stage="")
@@ -709,7 +744,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "already running"})
             LOG.clear(); RESULTS.clear()
             opts = {k: q.get(k, ["0"])[0] == "1" for k in ("rotate", "redo", "verbose")}
-            opts["lang"] = q.get("lang", ["eng"])[0]
+            # "eng+ara" arrives as "eng ara" if the client forgets to encode the +
+            opts["lang"] = q.get("lang", ["eng"])[0].strip().replace(" ", "+")
             threading.Thread(target=run_batch, args=(opts,), daemon=True).start()
             self._json({"ok": True})
         elif u.path == "/cancel":
@@ -724,7 +760,7 @@ class Handler(BaseHTTPRequestHandler):
             if not d.is_dir():
                 return self._json({"ok": False, "error": "Folder not found"})
             n = 0
-            for path in RESULTS.values():
+            for path in list(RESULTS.values()):
                 target = d / path.name
                 if target.exists():
                     target = d / f"{path.stem}_{uuid.uuid4().hex[:4]}.pdf"
@@ -760,6 +796,8 @@ def selftest():
     assert c[c.index("--output-type") + 1] == "pdf"
     assert "--redo-ocr" in ocr_cmd(Path("a"), Path("b"), {"redo": True})
     assert ocr_cmd(Path("a"), Path("b"), {"lang": "nonsense"})[3:5] == ["-l", "eng"]
+    assert "encodeURIComponent($('lang').value)" in PAGE   # + means space in a query
+    assert '.strip().replace(" ", "+")' in open(__file__, encoding="utf-8").read()
     assert "--deskew" not in " ".join(ocr_cmd(Path("a"), Path("b"), {"deskew": True}))
 
     assert JUNK.search("[WinError 2] The system cannot find the file specified")
@@ -786,6 +824,12 @@ def selftest():
     assert "taskkill" in open(__file__, encoding="utf-8").read()   # cancel kills the tree
     assert "j.eta" not in PAGE and "mins left" not in PAGE   # no time estimate shown
     assert ".k-tech" in PAGE and ".k-plain" in PAGE
+    # `running` is the busy flag; shadowing it inside tick() threw on assignment
+    assert "const running=" not in PAGE and "function setBusy(on)" in PAGE
+    assert "LOCKS=['pick','clear','lang','rotate','redo','verbose','path']" in PAGE
+    assert "const esc=" in PAGE and "esc(r.name)" in PAGE      # names are escaped
+    assert "pollFails" in PAGE                                # a dead poll unlocks
+    assert "a run is in progress" in open(__file__, encoding="utf-8").read()
     assert "--term-green" not in PAGE and "--term-amber" not in PAGE  # four colours total
     assert classify("   1 [tesseract] Too few characters. Skipping this page")[1] == "plain"
     for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose", "remove"):
