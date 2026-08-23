@@ -66,12 +66,18 @@ def decide(page, workdir: Path, index: int, lang: str) -> tuple[int, str]:
     return 0, "too little text to tell which way up it is - left alone"
 
 
-def prerotate(src: Path, dst: Path, lang: str = "eng", report=print) -> list:
-    """Write dst = src with every page upright. Only /Rotate changes; pixels do not."""
+def prerotate(src: Path, dst: Path, lang: str = "eng", report=print, should_stop=None) -> list:
+    """Write dst = src with every page upright. Only /Rotate changes; pixels do not.
+
+    should_stop is polled once per page so a cancelled run stops on the next page
+    rather than straightening the whole document first.
+    """
     decisions = []
     render_doc = pdfium.PdfDocument(src)
     with pikepdf.open(src) as pdf, tempfile.TemporaryDirectory() as td:
         for i, page in enumerate(pdf.pages):
+            if should_stop and should_stop():
+                break
             turn, why = decide(render_doc[i], Path(td), i, lang)
             if turn:
                 page.obj["/Rotate"] = (int(page.obj.get("/Rotate", 0)) + turn) % 360

@@ -52,21 +52,6 @@ def page_count(pdf: Path) -> int:
         return 1
 
 
-def eta_seconds() -> float | None:
-    """Rough time remaining, extrapolated from the pages finished so far.
-
-    Pages are OCR'd several at a time, so the counter reaches the total while the
-    last few still run. Hold it one short so the estimate keeps ticking.
-    """
-    if not STATE["running"]:
-        return None
-    total = STATE["units_total"]
-    done = min(STATE["units_done"], total - 1) if total else 0
-    if done < 2 or not total:
-        return None
-    return (time.time() - STATE["started"]) / done * (total - done)
-
-
 def ocr_cmd(src: Path, dst: Path, o: dict) -> list:
     cmd = [sys.executable, "-m", "ocrmypdf",
            "-l", LANGS.get(o.get("lang", "eng"), "eng"),
@@ -79,6 +64,25 @@ def ocr_cmd(src: Path, dst: Path, o: dict) -> list:
     # wrong place when the page already carries a /Rotate flag, which most
     # scanners set. prerotate.py turns the page upright first instead.
     return cmd + ["-v", "1", str(src), str(dst)]
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Stop OCRmyPDF and everything it started.
+
+    terminate() only signals the parent; OCRmyPDF runs tesseract and ghostscript
+    as children of its own worker processes, and those keep writing to the pipe,
+    so the run appeared to carry on after Cancel.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        else:
+            os.killpg(os.getpgid(proc.pid), 9)
+    except Exception:
+        proc.kill()
 
 
 def child_env() -> dict:
@@ -98,7 +102,7 @@ def classify(line: str) -> tuple[str, str, str] | None:
             return page, "turn", f"turned upright  ·  confidence {float(conf):.2f}"
         return page, "dim", f"already upright  ·  confidence {float(conf):.2f}"
     if "Too few characters" in line:
-        return "", "warn", "too little text to tell which way up it is - left alone"
+        return "", "plain", "too little text to tell which way up it is - left alone"
     if re.search(r"\b(ERROR|CRITICAL|Error during processing)\b", line):
         return "", "bad", line.strip()
     return None
@@ -117,7 +121,7 @@ def note_prerotate(msg: str, row: dict) -> None:
     elif what.startswith("left upright"):
         log(f"already upright  ·  {why}", "dim", page)
     else:
-        log("too little text to tell which way up it is - left alone", "warn", page)
+        log("too little text to tell which way up it is - left alone", "plain", page)
 
 
 def run_batch(opts: dict) -> None:
@@ -145,10 +149,11 @@ def run_batch(opts: dict) -> None:
                 try:
                     upright = src.parent / f"{src.stem}_upright.pdf"
                     prerotate(src, upright, opts.get("lang", "eng").split("+")[0],
-                              report=lambda m: note_prerotate(m, row))
+                              report=lambda m: note_prerotate(m, row),
+                              should_stop=lambda: STATE["cancel"])
                     ocr_src = upright
                 except Exception as exc:
-                    log(f"could not pre-rotate ({exc!r}); reading pages as they are", "warn")
+                    log(f"could not pre-rotate ({exc!r}); reading pages as they are", "bad")
                     STATE["units_done"] += pages
             if STATE["cancel"]:
                 row["state"] = "cancelled"
@@ -159,9 +164,12 @@ def run_batch(opts: dict) -> None:
             p = subprocess.Popen(ocr_cmd(ocr_src, dst, opts), stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  errors="replace", env=child_env(),
-                                 creationflags=CREATE_NO_WINDOW)
+                                 creationflags=CREATE_NO_WINDOW,
+                                 start_new_session=os.name != "nt")
             STATE["proc"] = p
             for line in p.stdout:
+                if STATE["cancel"]:
+                    break
                 if JUNK.search(line):
                     continue
                 m = PAGE_NO.match(line)
@@ -174,17 +182,23 @@ def run_batch(opts: dict) -> None:
                 if opts.get("verbose"):
                     if not CHATTER.match(line):
                         g = m.group(1) if m else ""
-                        log(re.sub(r"^\s*\d+\s+", "", line).strip(), "dim", g)
+                        log(re.sub(r"^\s*\d+\s+", "", line).strip(), "tech", g)
                 else:
                     row_out = classify(line)
                     if row_out:
                         log(row_out[2], row_out[1], row_out[0])
-            code = p.wait()
+            if STATE["cancel"]:
+                kill_tree(p)
+            try:
+                code = p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                kill_tree(p)
+                code = -1
             STATE["proc"] = None
             STATE["units_done"] = base + pages
             if STATE["cancel"]:
                 row["state"] = "cancelled"
-                log("run cancelled - your files and settings are unchanged", "warn")
+                log("run cancelled - your files and settings are unchanged", "plain")
                 break
             if code == 0 and dst.exists():
                 ok += 1
@@ -217,8 +231,10 @@ PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
   --line:#D5DCE4; --line-strong:#B6C1CC;
   --accent:#14557A; --accent-ink:#FFFFFF; --accent-soft:#DDE9F1;
   --ok:#1B6B47; --warn:#8A5A00; --warn-soft:#FBF0DC; --bad:#A32B21;
-  --term-bg:#111A22; --term-ink:#C6D2DC; --term-dim:#6E8090;
-  --term-cyan:#5FB3D4; --term-green:#7FB77E; --term-amber:#D9A441; --term-red:#D4776C;
+  --term-bg:#111A22; --term-ink:#EAF1F7; --term-dim:#8698A8; --term-head:#A9BDCC;
+  /* two colours only, each with one meaning: a page was turned, something
+     failed. Everything else is plain white, or grey when it is plumbing. */
+  --term-cyan:#5FB3D4; --term-red:#D4776C;
   --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",monospace;
   --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
 }
@@ -229,53 +245,60 @@ PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
 /* a class that sets display beats the browser's own [hidden] rule, which is how
    the English+Arabic warning stayed on screen under every language */
 [hidden]{display:none !important}
-body{background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans)}
-.shell{max-width:1240px;margin:0 auto;padding:22px 18px 60px}
+body{background:var(--paper);color:var(--ink);
+     font:clamp(15px,0.34vw + 13.2px,18px)/1.6 var(--sans)}
+.shell{max-width:clamp(1240px,94vw,1720px);margin:0 auto;padding:22px 18px 60px}
 .mock{background:var(--surface);border:1px solid var(--line)}
 .appbar{display:flex;align-items:center;justify-content:space-between;gap:16px;
         padding:14px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .brand{display:flex;align-items:baseline;gap:10px}
-.brand .name{font:600 15px/1 var(--sans);letter-spacing:-.01em}
-.brand .tag{font:500 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+.brand .name{font:600 1.15em/1 var(--sans);letter-spacing:-.01em}
+.brand .tag{font:500 .72em/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
 .barright{display:flex;gap:10px;align-items:center}
 .langsw{display:flex;border:1px solid var(--line-strong)}
-.langsw button{font:600 11px/1 var(--mono);padding:7px 11px;color:var(--muted);
+.langsw button{font:600 .8em/1 var(--mono);padding:8px 13px;color:var(--muted);
                background:var(--surface);border:0;cursor:pointer}
 .langsw button.on{background:var(--accent);color:var(--accent-ink)}
-.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.eyebrow{font:700 .88em/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
 .panel{padding:18px}
 .panel+.panel{border-top:1px solid var(--line)}
 .plabel{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .plabel i{flex:1;height:1px;background:var(--line);font-style:normal}
-.chip{font:600 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
-      padding:4px 7px;background:var(--sunk);color:var(--muted);white-space:nowrap}
+.chip{font:600 .78em/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+      padding:5px 8px;background:var(--sunk);color:var(--muted);white-space:nowrap}
 .chip.ok{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
 .chip.run{background:var(--accent-soft);color:var(--accent)}
 .chip.wait{background:var(--sunk);color:var(--faint)}
+.chip.live{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
 .chip.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
-#drop{border:1.5px dashed var(--line-strong);background:var(--sunk);padding:22px;
-      text-align:center;color:var(--muted);font-size:13.5px;cursor:pointer}
+#drop{border:1.5px dashed var(--line-strong);background:var(--sunk);padding:26px;
+      text-align:center;color:var(--muted);font-size:.92em;cursor:pointer}
 #drop.hot{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
-#drop b{display:block;color:var(--ink);font-weight:600;font-size:14.5px;margin-bottom:3px}
+#drop b{display:block;color:var(--ink);font-weight:600;font-size:1.08em;margin-bottom:4px}
 #drop.hot b{color:var(--accent)}
 #queue{list-style:none;margin-top:12px;border:1px solid var(--line)}
 #queue:empty{display:none}
-#queue li{display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:center;
-          padding:8px 11px;font-size:13.5px;border-bottom:1px solid var(--line)}
+#queue li{display:grid;grid-template-columns:1fr auto auto auto;gap:12px;align-items:center;
+          padding:9px 11px;font-size:.92em;border-bottom:1px solid var(--line)}
 #queue li:last-child{border-bottom:0}
 #queue .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#queue .sz{font:500 12px/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
-label.opt{display:flex;align-items:center;gap:9px;font-size:14px;padding:5px 0;cursor:pointer}
+#queue .rm{border:0;background:transparent;color:var(--faint);cursor:pointer;
+  font:400 1.15em/1 var(--sans);padding:2px 5px;width:1.9em}
+#queue .rm:hover{color:var(--bad)}
+#queue .rm:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#queue .rm[hidden]{visibility:hidden;display:block !important}
+#queue .sz{font:500 .82em/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
+label.opt{display:flex;align-items:center;gap:9px;font-size:.96em;padding:6px 0;cursor:pointer}
 input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent)}
-select,input[type=text]{font:inherit;font-size:13.5px;padding:7px 10px;
+select,input[type=text]{font:inherit;font-size:.94em;padding:8px 11px;
   border:1px solid var(--line-strong);background:var(--surface);color:var(--ink)}
 .field{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-.warnbox{display:flex;gap:10px;background:var(--warn-soft);border-left:3px solid var(--warn);
-         padding:10px 12px;font-size:13px;margin:2px 0 12px}
-.warnbox .k{font:600 10px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+.warnbox{display:flex;gap:11px;background:var(--warn-soft);border-left:3px solid var(--warn);
+         padding:11px 13px;font-size:.9em;margin:2px 0 13px}
+.warnbox .k{font:700 .82em/1.5 var(--mono);letter-spacing:.09em;text-transform:uppercase;
             color:var(--warn);white-space:nowrap}
-.hint{font-size:12.5px;color:var(--faint);margin:-2px 0 8px 24px}
-.btn{font:600 13px/1 var(--sans);padding:11px 18px;border:1px solid var(--line-strong);
+.hint{font-size:.86em;color:var(--faint);margin:-2px 0 9px 25px}
+.btn{font:600 .92em/1 var(--sans);padding:12px 19px;border:1px solid var(--line-strong);
      background:var(--surface);color:var(--ink);cursor:pointer}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 .btn.danger{border-color:var(--bad);color:var(--bad);background:transparent}
@@ -284,24 +307,31 @@ select,input[type=text]{font:inherit;font-size:13.5px;padding:7px 10px;
 .actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
 .meter{height:4px;background:var(--sunk);overflow:hidden;margin:14px 0 8px}
 .meter i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
-.status{display:flex;justify-content:space-between;gap:12px;font:500 12px/1.4 var(--mono);
+.status{display:flex;justify-content:space-between;gap:12px;font:500 .84em/1.45 var(--mono);
         color:var(--muted);direction:ltr}
 .status .eta{font-variant-numeric:tabular-nums;color:var(--faint);white-space:nowrap}
-.term{background:var(--term-bg);color:var(--term-ink);font:12.5px/1.65 var(--mono);
+.term{background:var(--term-bg);color:var(--term-ink);font:.86em/1.7 var(--mono);
       display:flex;flex-direction:column;min-height:0}
-.term .head{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;
-  border-bottom:1px solid rgba(255,255,255,.09);color:var(--term-dim);
-  font-size:11px;letter-spacing:.08em;text-transform:uppercase}
-.term .body{padding:10px 0;overflow:auto;flex:1;direction:ltr;text-align:left;min-height:260px}
-.ln{display:grid;grid-template-columns:34px 1fr;gap:10px;padding:1px 12px}
+.term .head{display:flex;justify-content:space-between;gap:10px;padding:9px 13px;
+  border-bottom:1px solid rgba(255,255,255,.12);color:var(--term-head);
+  font-size:.92em;letter-spacing:.09em;text-transform:uppercase}
+/* a fixed viewport with its own scrollbar: the log used to stretch the page */
+.term .body{padding:10px 0;overflow-y:auto;overflow-x:hidden;direction:ltr;text-align:left;
+            height:clamp(300px,54vh,680px)}
+.ln{display:grid;grid-template-columns:2.4em 1fr;gap:11px;padding:1px 13px}
 .ln .g{color:var(--term-dim);text-align:right;font-variant-numeric:tabular-nums;user-select:none}
-.k-dim{color:var(--term-dim)} .k-turn{color:var(--term-cyan)} .k-ok{color:var(--term-green)}
-.k-warn{color:var(--term-amber)} .k-bad{color:var(--term-red)}
-.k-head{color:var(--term-ink);font-weight:600}
-.ln.k-head-row{margin-top:9px;padding-top:5px;border-top:1px solid rgba(255,255,255,.08)}
+.k-plain,.k-dim,.k-ok{color:var(--term-ink)}    /* ordinary lines and finishes: plain white */
+.k-ok{font-weight:600}
+.k-tech{color:var(--term-dim)}                  /* technical detail stays quiet */
+.k-turn{color:var(--term-cyan)}                 /* this page was turned */
+.k-warn{color:var(--term-ink)}                  /* kept for old lines; reads as plain */
+.k-bad{color:var(--term-red)}                   /* this failed */
+.k-head{color:var(--term-ink);font-weight:700;letter-spacing:.02em}
+.ln.k-head-row{margin-top:11px;padding-top:7px;padding-bottom:5px;
+  background:rgba(255,255,255,.05);border-top:1px solid rgba(255,255,255,.10)}
 .dlwrap{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
-a.dl{display:inline-block;padding:7px 12px;background:var(--accent-soft);
-     border:1px solid var(--accent);text-decoration:none;color:var(--accent);font-size:13px}
+a.dl{display:inline-block;padding:8px 13px;background:var(--accent-soft);
+     border:1px solid var(--accent);text-decoration:none;color:var(--accent);font-size:.9em}
 .ok-t{color:var(--ok);font-weight:600} .bad-t{color:var(--bad)}
 .split{display:grid}
 @media(min-width:900px){
@@ -370,7 +400,7 @@ a.dl{display:inline-block;padding:7px 12px;background:var(--accent-soft);
   <div class=right>
     <div class=panel style="border-bottom:1px solid var(--line);padding-bottom:12px">
       <div class=plabel style=margin-bottom:0><span class=eyebrow data-t=s_rec></span><i></i>
-        <span class=chip id=reclive hidden data-t=live></span></div>
+        <span class="chip wait" id=reclive data-t=idlechip></span></div>
     </div>
     <div class=term style=flex:1>
       <div class=head><span id=termfile data-t=idle></span><span id=termcount></span></div>
@@ -395,8 +425,8 @@ const STR={
   h_verbose:"Every internal step, not just what happened to each page",
   s_rec:"Log", live:"live", idle:"No run yet",
   start:"Start OCR", cancel:"Cancel run", save:"Save to folder",
-  running:"Running…", left:t=>`about ${t} left`,
-  q_done:"done", q_run:p=>`page ${p}`, q_wait:"queued", q_fail:"failed", q_cancel:"cancelled",
+  running:"Running…",
+  remove:"Remove", q_done:"done", q_run:p=>`page ${p}`, q_wait:"queued", q_fail:"failed", q_cancel:"cancelled",
   sum:(d,t,p)=>`${d} of ${t} documents · ${p} pages`,
   saved:n=>`Saved ${n} file(s)`, saving:"Saving…", notfound:"Folder not found",
   nfiles:(f,p)=>`${f} document(s) · ${p} pages`},
@@ -415,8 +445,8 @@ const STR={
   h_verbose:"كل خطوة داخلية، وليس ما حدث لكل صفحة فقط",
   s_rec:"السجل", live:"مباشر", idle:"لا توجد عملية بعد",
   start:"بدء المعالجة", cancel:"إلغاء العملية", save:"حفظ في المجلد",
-  running:"جارٍ التنفيذ…", left:t=>`يتبقى نحو ${t}`,
-  q_done:"تم", q_run:p=>`صفحة ${p}`, q_wait:"في الانتظار", q_fail:"فشل", q_cancel:"أُلغيت",
+  running:"جارٍ التنفيذ…",
+  remove:"إزالة", q_done:"تم", q_run:p=>`صفحة ${p}`, q_wait:"في الانتظار", q_fail:"فشل", q_cancel:"أُلغيت",
   sum:(d,t,p)=>`${d} من ${t} مستندات · ${p} صفحة`,
   saved:n=>`تم حفظ ${n} ملف`, saving:"جارٍ الحفظ…", notfound:"المجلد غير موجود",
   nfiles:(f,p)=>`${f} مستند · ${p} صفحة`}};
@@ -466,10 +496,11 @@ function pending(){
   $('save').disabled=true; $('summary').hidden=true;
   $('prog').style.width='0'; $('stage').textContent=''; $('eta').textContent='';
   $('termfile').textContent=STR[L].idle; $('termcount').textContent='';
+  setLive(false);
 }
 $('clear').onclick=async()=>{
   if(running) return;
-  files=[]; $('log').innerHTML=''; $('picker').value=''; $('reclive').hidden=true;
+  files=[]; $('log').innerHTML=''; $('picker').value=''; setLive(false);
   pending();
   await fetch(`/reset?t=${T}`,{method:'POST'}); paintQueue(); refresh();
 };
@@ -478,7 +509,7 @@ let serverFiles=[];
 function paintQueue(){
   const s=STR[L];
   const rows = serverFiles.length ? serverFiles : files.map(f=>({name:f.name,size:f.size}));
-  $('queue').innerHTML = rows.map(r=>{
+  $('queue').innerHTML = rows.map((r,i)=>{
     let cls='wait', txt=s.q_wait;
     if(r.state==='running'){cls='run'; txt=s.q_run(`${r.page}/${r.pages}`);}
     else if(r.state==='done'){cls='ok'; txt=s.q_done;}
@@ -487,8 +518,15 @@ function paintQueue(){
     else if(!r.state){cls='wait'; txt=(r.size/1048576).toFixed(1)+' MB';}
     const meta = r.pages ? `${r.pages} pp` : '';
     return `<li><span class=nm>${r.name}</span><span class=sz>${meta}</span>`+
-           `<span class="chip ${cls}">${txt}</span></li>`;
+           `<span class="chip ${cls}">${txt}</span>`+
+           `<button class=rm data-i="${i}" title="${s.remove}" aria-label="${s.remove}: ${r.name}"`+
+           `${running?' hidden':''}>&times;</button></li>`;
   }).join('');
+  $('queue').querySelectorAll('.rm').forEach(b=>b.onclick=()=>removeAt(+b.dataset.i));
+}
+function removeAt(i){
+  if(running) return;
+  files.splice(i,1); pending(); paintQueue(); refresh();
 }
 
 /* --- destination --- */
@@ -505,6 +543,11 @@ $('path').onchange=async()=>{
   $('dest').innerHTML=j.ok?'<span class=ok-t>✓ '+j.dir+'</span>':'<span class=bad-t>'+STR[L].notfound+'</span>';
   $('dest').dataset.set=j.ok?'1':''; refresh();
 };
+function setLive(on){
+  const c=$('reclive');
+  c.className='chip '+(on?'live':'wait');
+  c.textContent=on?STR[L].live:STR[L].idlechip;
+}
 const haveDest=()=>!!dirHandle||$('dest').dataset.set==='1';
 function refresh(){$('go').disabled=!(files.length&&haveDest())}
 
@@ -516,7 +559,7 @@ $('go').onclick=async()=>{
   $('save').disabled=true; $('cancel').hidden=false;
   $('go').textContent=STR[L].running;
   $('dl').innerHTML=''; $('savemsg').textContent=''; $('log').innerHTML='';
-  since=0; results=[]; $('prog').style.width='3%'; $('reclive').hidden=false;
+  since=0; results=[]; $('prog').style.width='3%'; setLive(true);
   await fetch(`/reset?t=${T}`,{method:'POST'});
   for(const f of files)
     await fetch(`/upload?t=${T}&name=${encodeURIComponent(f.name)}`,{method:'POST',body:f});
@@ -529,10 +572,6 @@ $('cancel').onclick=async()=>{
   $('cancel').disabled=true;
   await fetch(`/cancel?t=${T}`,{method:'POST'});
 };
-
-function fmt(sec){sec=Math.round(sec);
-  if(sec<60) return sec+'s';
-  const m=Math.round(sec/60); return m+(L==='ar'?' د':(m===1?' min':' mins'));}
 
 async function tick(){
   const j=await (await fetch(`/log?t=${T}&since=${since}`)).json();
@@ -558,9 +597,10 @@ async function tick(){
   }
   $('prog').style.width=Math.max(3,j.progress*100)+'%';
   $('stage').textContent=j.done?'':j.stage;
-  $('eta').textContent=(!j.done&&j.eta)?STR[L].left(fmt(j.eta)):'';
+  const totalPages=serverFiles.reduce((n,f)=>n+f.pages,0);
+  $('eta').textContent=totalPages?`${pagesDone} / ${totalPages} pages`:'';
   if(j.done){
-    clearInterval(poll); results=j.results; $('reclive').hidden=true;
+    clearInterval(poll); results=j.results; setLive(false);
     $('dl').innerHTML=results.map(r=>
       `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">↓ ${r.name}</a>`).join('');
     running=false;
@@ -632,7 +672,7 @@ class Handler(BaseHTTPRequestHandler):
             # at 100% for twenty seconds reads as a hang
             self._json({"lines": LOG[int(q.get("since", ["0"])[0]):], "next": len(LOG),
                         "done": done, "progress": 1.0 if done else min(0.95, frac),
-                        "stage": STATE["stage"], "eta": eta_seconds(), "files": FILES,
+                        "stage": STATE["stage"], "files": FILES,
                         "results": [{"id": k, "name": v.name} for k, v in RESULTS.items()]})
         elif u.path == "/checkdir":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
@@ -676,8 +716,8 @@ class Handler(BaseHTTPRequestHandler):
             # stop the current page and skip the rest; uploads and settings stay put
             STATE["cancel"] = True
             proc = STATE.get("proc")
-            if proc and proc.poll() is None:
-                proc.terminate()
+            if proc:
+                kill_tree(proc)
             self._json({"ok": True})
         elif u.path == "/save":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
@@ -726,7 +766,6 @@ def selftest():
     assert CHATTER.match("        1 Running: ['tesseract', '--version']")
     g, k, t = classify("        1 page is facing ⇨, confidence 1.52 - will rotate")
     assert (g, k) == ("1", "turn") and "turned upright" in t
-    assert classify("   1 [tesseract] Too few characters. Skipping this page")[1] == "warn"
     assert classify("   Postprocessing...") is None
     assert child_env()["PYTHONIOENCODING"] == "utf-8"
 
@@ -735,25 +774,21 @@ def selftest():
     note_prerotate("   page 3: turned 270 deg clockwise  (confidence 8.17)", row)
     assert LOG[-1]["k"] == "turn" and LOG[-1]["g"] == "3" and row["page"] == 3
     note_prerotate("   page 4: too little text to tell which way up it is - left alone", row)
-    assert LOG[-1]["k"] == "warn"
+    assert LOG[-1]["k"] == "plain"       # an outcome, not a warning
     LOG.clear(); STATE["units_done"] = 0
 
-    STATE.update(units_done=0, units_total=10, started=time.time(), running=True)
-    assert eta_seconds() is None                      # too early to guess
-    STATE.update(units_done=4, started=time.time() - 8)
-    assert 10 < eta_seconds() < 14                    # 2s per unit, 6 left
-    STATE.update(units_done=10, started=time.time() - 20)
-    assert eta_seconds() is not None                  # still ticking in the tail
-    STATE.update(running=False)
-    assert eta_seconds() is None
-    STATE.update(units_done=0, units_total=0, started=0.0)
 
     assert "Detailed record" not in PAGE and "h_verbose" in PAGE
     # adding a file after a run must reset the queue to the pending view
     assert "function pending()" in PAGE and "if(files.length!==before) pending();" in PAGE
     assert "if(running) return;" in PAGE
     assert "[hidden]{display:none !important}" in PAGE   # .warnbox sets display:flex
-    for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose"):
+    assert "taskkill" in open(__file__, encoding="utf-8").read()   # cancel kills the tree
+    assert "j.eta" not in PAGE and "mins left" not in PAGE   # no time estimate shown
+    assert ".k-tech" in PAGE and ".k-plain" in PAGE
+    assert "--term-green" not in PAGE and "--term-amber" not in PAGE  # four colours total
+    assert classify("   1 [tesseract] Too few characters. Skipping this page")[1] == "plain"
+    for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose", "remove"):
         assert f"{key}:" in PAGE, key
     assert "PDF/A" not in PAGE and "NAPS2" not in PAGE and "deskew" not in PAGE.lower()
     assert "العربية" in PAGE and "rtl" in PAGE
