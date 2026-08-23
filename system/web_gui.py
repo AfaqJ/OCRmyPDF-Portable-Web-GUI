@@ -4,10 +4,12 @@ Python's own http.server serves one page on 127.0.0.1, so this needs no GUI
 library, no extra DLLs and nothing installed. Drop PDFs on the page, choose
 where results go, press Start, watch the log.
 """
-import json, os, re, secrets, shutil, subprocess, sys, tempfile, threading, uuid, webbrowser
+import json, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
+
+import pypdfium2 as pdfium
 
 from prerotate import prerotate
 
@@ -19,7 +21,8 @@ LANGS = {"eng": "eng", "eng+ara": "eng+ara", "ara": "ara"}
 UPLOADS: list[Path] = []
 RESULTS: dict[str, Path] = {}
 LOG: list[str] = []
-STATE = {"running": False, "done": False}
+STATE = {"running": False, "done": False,
+         "units_done": 0, "units_total": 0, "stage": "", "started": 0.0}
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # Things the user must never be shown: probes for optional tools we do not ship,
@@ -32,6 +35,7 @@ CHATTER = re.compile(r"^\s*(\d+\s+)?(Running: \[|pikepdf mmap|os\.symlink|xref \
                      r"stdout/stderr = |Evaluating lazy import|Gathering info|Using Tesseract OpenMP|"
                      r"\[tesseract\] OMP:|resolution \(|XrefExt\(|Adjusting rendered|"
                      r".*optimize\.pdf ->|[a-z]{3}(_[a-z]+)*$)")
+PAGE_NO = re.compile(r"^\s*(\d+)\s+\S")     # ocrmypdf -v 1 prefixes lines with the page
 FACING = re.compile(r"(?:^|\s)(\d+)\s+page is facing (.), confidence ([\d.]+) - (.*)")
 ARROWS = {"⇧": "upright", "⇨": "on its side (facing right)",
           "⇩": "upside down", "⇦": "on its side (facing left)"}
@@ -39,6 +43,29 @@ ARROWS = {"⇧": "upright", "⇨": "on its side (facing right)",
 
 def log(msg: str) -> None:
     LOG.append(ANSI.sub("", msg.rstrip()))
+
+
+def page_count(pdf: Path) -> int:
+    try:
+        return len(pdfium.PdfDocument(pdf))
+    except Exception:
+        return 1
+
+
+def eta_seconds() -> float | None:
+    """Rough time remaining, extrapolated from the pages finished so far.
+
+    Pages are OCR'd several at a time, so the counter reaches the total while the
+    last few are still running. Hold it one short of the total so the estimate
+    keeps ticking instead of vanishing during the tail.
+    """
+    if not STATE["running"]:
+        return None
+    total = STATE["units_total"]
+    done = min(STATE["units_done"], total - 1) if total else 0
+    if done < 2 or not total:
+        return None
+    return (time.time() - STATE["started"]) / done * (total - done)
 
 
 def friendly(line: str) -> str | None:
@@ -81,22 +108,41 @@ def child_env() -> dict:
 
 
 def run_batch(opts: dict) -> None:
-    """Worker thread: OCR every uploaded file, streaming output into LOG."""
-    STATE.update(running=True, done=False)
+    """Worker thread: OCR every uploaded file, streaming output into LOG.
+
+    Progress is counted in pages, not files, so a single long document still
+    moves the bar. Each page costs one unit to straighten and one to read.
+    """
+    per_page = 2 if opts.get("rotate") else 1
+    counts = {src: page_count(src) for src in UPLOADS}
+    STATE.update(running=True, done=False, units_done=0, started=time.time(),
+                 units_total=max(1, sum(n * per_page for n in counts.values())))
     ok = fail = 0
     try:
         for i, src in enumerate(UPLOADS, 1):
+            pages = counts[src]
             dst = src.parent / f"{src.stem}_ocr.pdf"
-            log(f"[{i}/{len(UPLOADS)}] {src.name}")
+            log(f"[{i}/{len(UPLOADS)}] {src.name}  ({pages} page{'s' if pages != 1 else ''})")
             ocr_src = src
             if opts.get("rotate"):
+                STATE["stage"] = f"{src.name} - checking which way up each page is"
                 log("   checking which way up each page is...")
                 try:
                     upright = src.parent / f"{src.stem}_upright.pdf"
-                    prerotate(src, upright, opts.get("lang", "eng").split("+")[0], report=log)
+
+                    def note(msg: str) -> None:
+                        log(msg)
+                        STATE["units_done"] += 1
+
+                    prerotate(src, upright, opts.get("lang", "eng").split("+")[0], report=note)
                     ocr_src = upright
                 except Exception as exc:
                     log(f"   could not pre-rotate ({exc!r}); reading pages as they are")
+                    STATE["units_done"] += pages
+
+            STATE["stage"] = f"{src.name} - reading the text"
+            base = STATE["units_done"]
+            seen = 0
             p = subprocess.Popen(ocr_cmd(ocr_src, dst, opts), stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  errors="replace", env=child_env(),
@@ -104,6 +150,13 @@ def run_batch(opts: dict) -> None:
             for line in p.stdout:
                 if JUNK.search(line):
                     continue
+                m = PAGE_NO.match(line)
+                if m:
+                    seen = max(seen, min(int(m.group(1)), pages))
+                    STATE["units_done"] = base + seen
+                    STATE["stage"] = (f"{src.name} - finishing the last pages"
+                                      if seen >= pages else
+                                      f"{src.name} - reading page {seen} of {pages}")
                 if opts.get("verbose"):
                     if not CHATTER.match(line):
                         log("   " + line)
@@ -111,6 +164,7 @@ def run_batch(opts: dict) -> None:
                     nice = friendly(line)
                     if nice:
                         log(nice)
+            STATE["units_done"] = base + pages
             if p.wait() == 0 and dst.exists():
                 ok += 1
                 RESULTS[uuid.uuid4().hex] = dst
@@ -124,7 +178,7 @@ def run_batch(opts: dict) -> None:
     except Exception as exc:                       # never leave the UI hanging
         log(f"Unexpected error: {exc!r}")
     finally:
-        STATE.update(running=False, done=True)
+        STATE.update(running=False, done=True, stage="")
 
 
 PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
@@ -177,6 +231,7 @@ button:disabled{opacity:.45;cursor:default}
 a.dl{display:inline-block;margin:7px 8px 0 0;padding:8px 14px;background:#e9f1fc;border:1px solid #bcd4ef;
      border-radius:8px;text-decoration:none;color:var(--accent-dark);font-size:14px}
 .ok{color:var(--ok);font-weight:600} .bad{color:var(--bad)}
+#stage{margin-top:7px;font-size:13px;min-height:19px;direction:ltr;text-align:start}
 [dir=rtl] .info{border-radius:7px 0 0 7px}
 [dir=rtl] #log{direction:ltr;text-align:left}
 </style>
@@ -236,6 +291,7 @@ a.dl{display:inline-block;margin:7px 8px 0 0;padding:8px 14px;background:#e9f1fc
     <button id=save class=act data-t=save disabled></button><span id=savemsg></span>
   </div>
   <div class=bar><i id=prog></i></div>
+  <p class=sub id=stage></p>
   <div id=dl></div>
   <div id=log></div>
 </div>
@@ -259,7 +315,7 @@ const STR={
      o_verbose:"Detailed log",
      t_verbose:"Shows every internal step instead of a short summary. Useful only when something goes wrong.",
      s4:"Run", start:"Start OCR", save:"Save to folder", clear:"Clear list",
-     nfiles:n=>`${n} file(s) ready`,
+     nfiles:n=>`${n} file(s) ready`, left:t=>`about ${t} left`,
      ready:"Ready. Add some PDFs to begin.", saving:"Saving…",
      saved:n=>`Saved ${n} file(s)`, nofiles:"Add at least one PDF first.",
      notfound:"Folder not found"},
@@ -280,7 +336,7 @@ const STR={
      o_verbose:"سجل تفصيلي",
      t_verbose:"يعرض كل خطوة داخلية بدلًا من ملخص مختصر. مفيد فقط عند حدوث مشكلة.",
      s4:"التشغيل", start:"بدء المعالجة", save:"حفظ في المجلد", clear:"مسح القائمة",
-     nfiles:n=>`${n} ملف جاهز`,
+     nfiles:n=>`${n} ملف جاهز`, left:t=>`يتبقى نحو ${t}`,
      saving:"جارٍ الحفظ…",   /* the log itself stays English in both languages */
      saved:n=>`تم حفظ ${n} ملف`, nofiles:"أضف ملف PDF واحدًا على الأقل.",
      notfound:"المجلد غير موجود"}};
@@ -367,13 +423,22 @@ async function tick(){
   since=j.next;
   if(j.lines.length){$('log').textContent+=j.lines.join('\n')+'\n';$('log').scrollTop=1e9}
   $('prog').style.width=Math.max(4,j.progress*100)+'%';
+  $('stage').textContent = j.done ? '' :
+    [j.stage, j.eta ? STR[L].left(fmt(j.eta)) : ''].filter(Boolean).join('  -  ');
   if(j.done){
     clearInterval(poll); results=j.results;
     $('dl').innerHTML=results.map(r=>
       `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">⬇ ${r.name}</a>`).join('');
     $('go').disabled=$('pick').disabled=false;
     $('save').disabled=!results.length;
+    $('stage').textContent='';
   }
+}
+function fmt(sec){
+  sec=Math.round(sec);
+  if(sec<60) return sec+'s';
+  const m=Math.round(sec/60);
+  return m+(L==='ar'? ' د' : m===1?' min':' mins');
 }
 
 /* 4. save */
@@ -430,9 +495,15 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(200, "text/html; charset=utf-8", PAGE.encode())
         elif u.path == "/log":
+            done = STATE["done"] and not STATE["running"]
+            # cap at 95% while running: the last stretch is unpredictable, and a bar
+            # that sits at 100% for 20 seconds reads as a hang
+            frac = STATE["units_done"] / STATE["units_total"] if STATE["units_total"] else 0
             self._json({"lines": LOG[int(q.get("since", ["0"])[0]):], "next": len(LOG),
-                        "done": STATE["done"] and not STATE["running"],
-                        "progress": min(1.0, len(RESULTS) / max(len(UPLOADS), 1)),
+                        "done": done,
+                        "progress": 1.0 if done else min(0.95, frac),
+                        "stage": STATE["stage"],
+                        "eta": eta_seconds(),
                         "results": [{"id": k, "name": v.name} for k, v in RESULTS.items()]})
         elif u.path == "/checkdir":
             d = Path(q.get("dir", [""])[0].strip().strip('"'))
@@ -536,6 +607,17 @@ def selftest():
         assert f'{key}:"' in PAGE or f"{key}:" in PAGE, key
     assert "PDF/A" not in PAGE and "NAPS2" not in PAGE      # both removed on request
     assert "العربية" in PAGE and "dir=rtl" in PAGE
+    assert PAGE_NO.match("        7 Rasterizing page 7").group(1) == "7"
+    assert not PAGE_NO.match("Postprocessing...")
+    STATE.update(units_done=0, units_total=10, started=time.time(), running=True)
+    assert eta_seconds() is None                     # too early to guess
+    STATE.update(units_done=4, started=time.time() - 8)
+    assert 10 < eta_seconds() < 14                   # 2s per unit, 6 left
+    STATE.update(units_done=10, started=time.time() - 20)
+    assert eta_seconds() is not None                 # still ticking in the tail
+    STATE.update(running=False)
+    assert eta_seconds() is None                     # nothing running, no estimate
+    STATE.update(units_done=0, units_total=0, started=0.0)
     print("selftest ok - bilingual browser UI, no desktop toolkit needed")
 
 
