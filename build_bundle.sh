@@ -42,5 +42,5 @@ rm -rf "$OUT/app"/{include,conda-meta,man} "$OUT/app/Library/include" \
 find "$OUT/app" \( -name '*.lib' -o -name '*.a' -o -name '*.pdb' \) -delete
 find "$OUT/app" -name '__pycache__' -type d -prune -exec rm -rf {} +
 
-cp src/* "$OUT/"
+cp ./*.bat ./*.py ./*.pdf "READ ME FIRST.txt" "$OUT/"
 echo "built $OUT  ($(du -sh "$OUT" | cut -f1))"

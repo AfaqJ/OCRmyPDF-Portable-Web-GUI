@@ -15,7 +15,7 @@ failed with `%1 is not a valid Win32 application` even with every Tcl/Tk DLL pre
 correct and 64-bit. Rather than keep fighting it, the GUI moved to
 `http.server` — Python's own standard library — serving one page on `127.0.0.1`.
 
-No framework, no dependency, no build step. One file: [`src/web_gui.py`](src/web_gui.py).
+No framework, no dependency, no build step. One file: [`web_gui.py`](web_gui.py).
 
 ## Using it
 
@@ -28,7 +28,8 @@ No framework, no dependency, no build step. One file: [`src/web_gui.py`](src/web
 
 ## Building the bundle
 
-`src/` holds the scripts. The 300 MB `app/` runtime is not in the repo — build it:
+The bundle is committed whole, so **Code -> Download ZIP** gives you a working copy with
+nothing else to do. To rebuild the `app/` runtime from scratch instead:
 
 ```bash
 ./build_bundle.sh
