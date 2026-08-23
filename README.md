@@ -68,12 +68,15 @@ OCRmyPDF is then run without `--rotate-pages` on a page that is already the righ
 up. Only `/Rotate` is changed; the scanned pixels are untouched. That brings the last
 row back to 2.7 px and 176 of 181 words.
 
-**Orientation detection gives up on sparse pages.** Tesseract's detector reports a
-confidence that tracks how much text is on the page: dense contract pages score 26–34,
-drawings and title sheets score 0.7–1.6, and pages that are nearly all diagram score
-0.00 and are simply skipped. `prerotate.py` therefore falls back to OCRing all four
-orientations and keeping whichever reads best — four times the work, so it only runs on
-the pages the detector could not settle.
+**Orientation detection abstains on sparse pages.** Tesseract reports an angle and a
+confidence, and the confidence tracks how much text is on the page rather than how sure
+the angle is — dense contract pages score 26–34, drawing sheets 0.7–1.9, and pages that
+are nearly all diagram return no angle at all. Across 11 test pages the angle was
+correct even at the bottom of that range, so `prerotate.py` acts on any angle offered
+and leaves the no-angle pages exactly as they are. Guessing those was tried and
+measured: OCRing all four orientations and keeping the best-scoring one picked the
+wrong way up on pages carrying a single label, so it was removed. A page with almost no
+text is left alone rather than turned at random.
 
 ## Limitations
 
