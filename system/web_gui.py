@@ -226,6 +226,9 @@ PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
    and the record panel is the one dark surface by design. Every colour below is
    painted explicitly so the page never borrows the browser's dark ground. */
 *{box-sizing:border-box;margin:0;padding:0}
+/* a class that sets display beats the browser's own [hidden] rule, which is how
+   the English+Arabic warning stayed on screen under every language */
+[hidden]{display:none !important}
 body{background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans)}
 .shell{max-width:1240px;margin:0 auto;padding:22px 18px 60px}
 .mock{background:var(--surface);border:1px solid var(--line)}
@@ -420,7 +423,7 @@ const STR={
 
 const T=new URLSearchParams(location.search).get('t');
 const $=id=>document.getElementById(id);
-let L='en', files=[], dirHandle=null, since=0, poll=null, results=[];
+let L='en', files=[], dirHandle=null, since=0, poll=null, results=[], running=false;
 
 function apply(lang){
   L=lang; const s=STR[lang];
@@ -447,16 +450,27 @@ $('picker').onchange=e=>add([...e.target.files]);
 ['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('hot')}));
 drop.addEventListener('drop',e=>add([...e.dataTransfer.files]));
 function add(fs){
+  if(running) return;                      /* the queue is live; do not edit it mid-run */
   fs=fs.filter(f=>f.name.toLowerCase().endsWith('.pdf'));
+  const before=files.length;
   for(const f of fs) if(!files.some(x=>x.name===f.name&&x.size===f.size)) files.push(f);
+  if(files.length!==before) pending();     /* last run's results no longer describe this list */
   paintQueue(); refresh();
 }
+/* Changing the list after a run invalidates what is on screen: the old rows still
+   said "done", and a newly added file was not drawn at all because the queue
+   preferred the server's finished list. Drop back to the pending view. */
+function pending(){
+  serverFiles=[]; results=[];
+  $('dl').innerHTML=''; $('savemsg').textContent='';
+  $('save').disabled=true; $('summary').hidden=true;
+  $('prog').style.width='0'; $('stage').textContent=''; $('eta').textContent='';
+  $('termfile').textContent=STR[L].idle; $('termcount').textContent='';
+}
 $('clear').onclick=async()=>{
-  files=[]; results=[]; serverFiles=[]; $('dl').innerHTML=''; $('savemsg').textContent='';
-  $('log').innerHTML=''; $('picker').value=''; $('prog').style.width='0';
-  $('stage').textContent=''; $('eta').textContent=''; $('save').disabled=true;
-  $('summary').hidden=true; $('reclive').hidden=true; $('termfile').textContent=STR[L].idle;
-  $('termcount').textContent='';
+  if(running) return;
+  files=[]; $('log').innerHTML=''; $('picker').value=''; $('reclive').hidden=true;
+  pending();
   await fetch(`/reset?t=${T}`,{method:'POST'}); paintQueue(); refresh();
 };
 
@@ -496,7 +510,9 @@ function refresh(){$('go').disabled=!(files.length&&haveDest())}
 
 /* --- run --- */
 $('go').onclick=async()=>{
+  running=true;
   $('go').disabled=$('pick').disabled=$('clear').disabled=true;
+  drop.setAttribute('aria-disabled','true'); drop.style.opacity='.55';
   $('save').disabled=true; $('cancel').hidden=false;
   $('go').textContent=STR[L].running;
   $('dl').innerHTML=''; $('savemsg').textContent=''; $('log').innerHTML='';
@@ -547,7 +563,9 @@ async function tick(){
     clearInterval(poll); results=j.results; $('reclive').hidden=true;
     $('dl').innerHTML=results.map(r=>
       `<a class=dl download="${r.name}" href="/result?t=${T}&id=${r.id}">↓ ${r.name}</a>`).join('');
+    running=false;
     $('go').disabled=$('pick').disabled=$('clear').disabled=false;
+    drop.removeAttribute('aria-disabled'); drop.style.opacity='';
     $('go').textContent=STR[L].start;
     $('cancel').hidden=true; $('cancel').disabled=false;
     $('save').disabled=!results.length; refresh();
@@ -731,6 +749,10 @@ def selftest():
     STATE.update(units_done=0, units_total=0, started=0.0)
 
     assert "Detailed record" not in PAGE and "h_verbose" in PAGE
+    # adding a file after a run must reset the queue to the pending view
+    assert "function pending()" in PAGE and "if(files.length!==before) pending();" in PAGE
+    assert "if(running) return;" in PAGE
+    assert "[hidden]{display:none !important}" in PAGE   # .warnbox sets display:flex
     for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose"):
         assert f"{key}:" in PAGE, key
     assert "PDF/A" not in PAGE and "NAPS2" not in PAGE and "deskew" not in PAGE.lower()
