@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from enum import IntEnum
 
 
 class NetworkUnavailable(OSError):
@@ -28,35 +29,72 @@ def disabled(*args, **kwargs):
     raise NetworkUnavailable("Networking is disabled in the native OCR runtime")
 
 
+class AddressFamily(IntEnum):
+    AF_UNSPEC = 0
+    AF_UNIX = 1
+    AF_INET = 2
+    AF_INET6 = 23
+
+
 def socket_placeholder() -> types.ModuleType:
     module = types.ModuleType("socket")
     module._GLOBAL_DEFAULT_TIMEOUT = object()
     module.socket = DisabledSocket
     module.SocketType = DisabledSocket
+    module.SocketIO = DisabledSocket
+    module.AddressFamily = AddressFamily
     module.error = NetworkUnavailable
     module.timeout = TimeoutError
     module.gaierror = NetworkUnavailable
     module.herror = NetworkUnavailable
     module.has_ipv6 = False
-    module.AF_INET = 2
-    module.AF_INET6 = 23
-    module.SOCK_STREAM = 1
-    module.SOCK_DGRAM = 2
-    module.SOL_SOCKET = 0xFFFF
-    module.SO_REUSEADDR = 4
-    module.SO_TYPE = 0x1008
-    module.IPPROTO_TCP = 6
-    module.TCP_NODELAY = 1
-    module.SHUT_RDWR = 2
+    constants = {
+        "AF_UNSPEC": 0,
+        "AF_UNIX": 1,
+        "AF_INET": 2,
+        "AF_INET6": 23,
+        "AI_PASSIVE": 1,
+        "IPPROTO_TCP": 6,
+        "IPPROTO_UDP": 17,
+        "IPPROTO_IPV6": 41,
+        "IPV6_V6ONLY": 27,
+        "SHUT_RD": 0,
+        "SHUT_WR": 1,
+        "SHUT_RDWR": 2,
+        "SOCK_STREAM": 1,
+        "SOCK_DGRAM": 2,
+        "SOL_SOCKET": 0xFFFF,
+        "SO_BROADCAST": 0x20,
+        "SO_ERROR": 0x1007,
+        "SO_REUSEADDR": 4,
+        "SO_REUSEPORT": 0,
+        "SO_TYPE": 0x1008,
+        "TCP_NODELAY": 1,
+        "SCM_RIGHTS": 0,
+    }
+    for name, value in constants.items():
+        setattr(module, name, value)
     module.gethostname = lambda: os.environ.get("COMPUTERNAME", "localhost")
     module.getfqdn = lambda name="": name or module.gethostname()
     module.getdefaulttimeout = lambda: None
-    module.setdefaulttimeout = disabled
-    module.create_connection = disabled
-    module.getaddrinfo = disabled
-    module.fromfd = disabled
-    module.fromshare = disabled
-    module.socketpair = disabled
+    for name in (
+        "CMSG_SPACE",
+        "create_connection",
+        "create_server",
+        "fromfd",
+        "fromshare",
+        "getaddrinfo",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "getnameinfo",
+        "getservbyname",
+        "inet_aton",
+        "inet_ntoa",
+        "inet_pton",
+        "setdefaulttimeout",
+        "socketpair",
+    ):
+        setattr(module, name, disabled)
     return module
 
 
@@ -76,6 +114,7 @@ def prepare_runtime(force_fallback: bool = False) -> bool:
 
 def selftest() -> None:
     used_fallback = prepare_runtime(force_fallback=True)
+    import asyncio  # noqa: F401
     import email.utils  # noqa: F401
     import http.client  # noqa: F401
     import logging.handlers  # noqa: F401
@@ -86,6 +125,7 @@ def selftest() -> None:
 
     assert used_fallback
     assert sys.modules["socket"].socket is DisabledSocket
+    assert sys.modules["socket"].AF_UNSPEC == 0
     print("socketless OCR entry selftest ok")
 
 

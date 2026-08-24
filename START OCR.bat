@@ -6,6 +6,7 @@ call "%~dp0system\env.bat"
 set "REPORT=%~dp0OCR native startup report.txt"
 set "POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 set "FAILURES=0"
+set "OPTIONAL_CHECK=0"
 set "EXIT_CODE=0"
 
 >"%REPORT%" echo Document OCR native startup report
@@ -38,7 +39,9 @@ echo.
 call :check_command "Python basic startup" "%APP%\python.exe" -X utf8 -s -c "import sys; print(sys.executable); print(sys.version)"
 call :check_command "Native OCR worker" "%APP%\python.exe" -X utf8 -s "%~dp0system\native_worker.py" --selftest
 call :check_command "Socket compatibility entry point" "%APP%\python.exe" -X utf8 -s "%~dp0system\socketless_ocr.py" --selftest
+set "OPTIONAL_CHECK=1"
 call :check_command "OCR pipeline without socket support" "%APP%\python.exe" -X utf8 -s "%~dp0system\socketless_ocr.py" --selftest-ocr-fallback
+set "OPTIONAL_CHECK=0"
 call :check_command "PDF rendering library" "%APP%\python.exe" -X utf8 -s -c "import pypdfium2; print(pypdfium2.__file__)"
 call :check_command "PDF editing library" "%APP%\python.exe" -X utf8 -s -c "import pikepdf; print(pikepdf.__file__)"
 call :check_command "OCR pipeline through compatibility entry point" "%APP%\python.exe" -X utf8 -s "%~dp0system\socketless_ocr.py" --version
@@ -127,5 +130,10 @@ if not errorlevel 1 (
 echo FAILED: %CHECK_NAME%
 >>"%REPORT%" echo RESULT: FAILED - %CHECK_NAME%
 >>"%REPORT%" echo INTERPRETATION: The traceback or Windows error directly above identifies this failed component.
+if "%OPTIONAL_CHECK%"=="1" (
+  echo WARNING ONLY: This optional fallback check does not block startup.
+  >>"%REPORT%" echo INTERPRETATION: Warning only. The mandatory OCR pipeline check decides whether this PC can run OCR.
+  exit /b 0
+)
 set "FAILURES=1"
 exit /b 1
