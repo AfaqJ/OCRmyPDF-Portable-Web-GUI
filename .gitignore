@@ -1,3 +1,12 @@
 __pycache__/
 *.zip
 bin/micromamba
+
+# Local working context and handover notes. Keep these on the maintainer's
+# machine; the distributable tool does not need them.
+AGENTS.md
+CLAUDE.md
+OCR_Tool_Documentation.md
+docs/ARCHITECTURE.md
+docs/DECISIONS.md
+docs/STATE.md

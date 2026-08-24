@@ -21,7 +21,7 @@ OPTIONS
   Document language   English, English + Arabic, or Arabic only.
   Auto-rotate pages   fixes pages scanned sideways or upside down. On by default.
   Redo OCR            use when the file already has a wrong text layer.
-  Deskew              straightens slightly tilted scans.
+  Show technical detail  shows the internal processing log.
 
 IF SOMETHING GOES WRONG
   system\diagnostics\Self test.bat  runs six checks and ends with a real OCR.

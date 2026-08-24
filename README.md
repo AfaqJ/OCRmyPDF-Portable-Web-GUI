@@ -2,7 +2,7 @@
 
 Makes scanned PDFs searchable by adding an invisible text layer behind the
 scan. The page still looks exactly the same; the text can now be selected,
-copied, searched, and indexed by SharePoint.
+copied, searched, and indexed by compatible document systems.
 
 Nothing is installed. No admin rights, no Python on the machine, nothing added
 to PATH or the registry. Download, extract, double-click. Delete the folder and

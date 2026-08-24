@@ -12,7 +12,7 @@ How pages are judged
 --------------------
 Tesseract's orientation detector reports an angle and a confidence, and the
 confidence tracks how much text is on the page rather than how sure the angle
-is: dense contract pages score 26-34, drawing sheets 0.7-1.9. In testing the
+is: text-heavy pages score 26-34, drawing sheets 0.7-1.9. In testing the
 angle was correct even at the bottom of that range, so any angle it offers is
 acted on. When it finds too little text to offer one at all -- a page that is
 nearly all diagram -- the page is left exactly as it is, which is safer than

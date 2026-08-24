@@ -242,7 +242,7 @@ PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
   --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",monospace;
   --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
 }
-/* Deliberately light-only: this runs on office PCs whose theme setting varies,
+/* Deliberately light-only: this runs on target PCs whose theme setting varies,
    and the record panel is the one dark surface by design. Every colour below is
    painted explicitly so the page never borrows the browser's dark ground. */
 *{box-sizing:border-box;margin:0;padding:0}
