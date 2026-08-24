@@ -78,7 +78,8 @@ software, redistributed under their own licences:
     fpdf2, img2pdf       LGPL-3.0       used by OCRmyPDF
     Language data        Apache-2.0     from the Tesseract project
 
-Full licence texts and the list of sources are in `licenses\`.
+Full licence texts are in `LICENSES\`, and `LICENSES\NOTICE.txt` lists every
+bundled program with its version and where its source is published.
 
 Ghostscript is the one to be aware of. Artifex publishes it under the GNU
 Affero General Public License, or a paid commercial licence. Passing this
@@ -90,5 +91,6 @@ is sold, or offered as a service to people outside the organisation, read the
 AGPL first or buy the commercial licence from Artifex.
 
 The scripts written for this project (`START OCR.bat`, everything in
-`system\`, and `build_bundle.sh`) are released under the MIT licence. They call
-the bundled programs as separate programs and do not modify them.
+`system\`, and `build_bundle.sh`) are released under the MIT licence - see
+`LICENSE`. They call the bundled programs as separate programs, the same way
+OCRmyPDF itself calls Ghostscript, and do not modify them.

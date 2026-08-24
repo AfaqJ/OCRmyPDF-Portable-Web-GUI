@@ -6,7 +6,7 @@ of other people's software, redistributed under their own licences. Nothing
 listed below has been changed in any way. Full licence texts are in this
 folder.
 
-Ghostscript 10.07.1                                          AGPL-3.0
+Ghostscript 10.07.1                              AGPL-3.0-or-later
   Artifex Software, Inc.
   Source: https://ghostscript.com/releases/
   Build:  https://anaconda.org/conda-forge/ghostscript
@@ -24,7 +24,7 @@ Language data (eng, ara, osd)                                Apache-2.0
 OCRmyPDF 17.10.0                                             MPL-2.0
   Source: https://github.com/ocrmypdf/OCRmyPDF
 
-Python 3.12                                                  PSF
+Python 3.12                                                  PSF-2.0
   Source: https://www.python.org/downloads/
 
 pikepdf, pypdfium2, Pillow, lxml, cryptography, pdfminer.six,
@@ -32,7 +32,7 @@ rich, pydantic and other Python packages     MPL-2.0, BSD, MIT, Apache-2.0
   Each package keeps its own licence file in
   app\Lib\site-packages\<name>.dist-info\
 
-fpdf2, img2pdf                                               LGPL-3.0
+fpdf2, img2pdf                                   LGPL-3.0-or-later
   Used by OCRmyPDF. Shipped unmodified as plain Python source in
   app\Lib\site-packages\, so they can be replaced or upgraded in place.
 
@@ -42,27 +42,7 @@ Tcl/Tk                                                       Tcl licence
 THE SCRIPTS WRITTEN FOR THIS PROJECT
 ------------------------------------
 START OCR.bat, everything under system\, and build_bundle.sh are released
-under the MIT licence:
-
-  Copyright (c) 2026 Afaq Jamshaid
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
+under the MIT licence. The text is in LICENSE at the top of this folder.
 
 These scripts call the bundled programs as separate programs. They do not
 modify them and are not derived from them.
