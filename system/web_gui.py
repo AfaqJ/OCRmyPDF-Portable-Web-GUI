@@ -216,8 +216,10 @@ def run_batch(opts: dict) -> None:
                 row["state"] = "cancelled" if STATE["cancel"] else row["state"]
         if STATE["cancel"]:
             log("Cancelled.", "head")
+        elif fail:
+            log(f"Finished  ·  {ok} succeeded, {fail} failed", "bad")
         else:
-            log(f"Finished  ·  {ok} succeeded, {fail} failed", "head")
+            log(f"Finished  ·  {ok} succeeded", "done")
     except Exception as exc:                       # never leave the UI hanging
         log(f"unexpected error: {exc!r}", "bad")
     finally:
@@ -236,7 +238,7 @@ PAGE = r"""<!doctype html><html lang=en dir=ltr><meta charset=utf-8>
   --term-bg:#111A22; --term-ink:#EAF1F7; --term-dim:#8698A8; --term-head:#A9BDCC;
   /* two colours only, each with one meaning: a page was turned, something
      failed. Everything else is plain white, or grey when it is plumbing. */
-  --term-cyan:#5FB3D4; --term-red:#D4776C;
+  --term-cyan:#5FB3D4; --term-red:#D4776C; --term-green:#7FB77E;
   --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono",monospace;
   --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
 }
@@ -313,17 +315,21 @@ select,input[type=text]{font:inherit;font-size:.94em;padding:8px 11px;
         color:var(--muted);direction:ltr}
 .status .eta{font-variant-numeric:tabular-nums;color:var(--faint);white-space:nowrap}
 .term{background:var(--term-bg);color:var(--term-ink);font:.86em/1.7 var(--mono);
-      display:flex;flex-direction:column;min-height:0}
+      display:flex;flex-direction:column;min-height:0;flex:1}
 .term .head{display:flex;justify-content:space-between;gap:10px;padding:9px 13px;
   border-bottom:1px solid rgba(255,255,255,.12);color:var(--term-head);
   font-size:.92em;letter-spacing:.09em;text-transform:uppercase}
-/* a fixed viewport with its own scrollbar: the log used to stretch the page */
-.term .body{padding:10px 0;overflow-y:auto;overflow-x:hidden;direction:ltr;text-align:left;
-            height:clamp(300px,54vh,680px)}
+/* The scroller is taken out of flow so its content cannot set the column's
+   height. Without this the log either stopped half way down (fixed height)
+   or stretched the whole page (auto height). */
+.term .scroll{position:relative;flex:1;min-height:0}
+.term .body{position:absolute;inset:0;padding:10px 0;overflow-y:auto;overflow-x:hidden;
+            direction:ltr;text-align:left}
 .ln{display:grid;grid-template-columns:2.4em 1fr;gap:11px;padding:1px 13px}
 .ln .g{color:var(--term-dim);text-align:right;font-variant-numeric:tabular-nums;user-select:none}
 .k-plain,.k-dim,.k-ok{color:var(--term-ink)}    /* ordinary lines and finishes: plain white */
 .k-ok{font-weight:600}
+.k-done{color:var(--term-green);font-weight:700}  /* the run finished with nothing failed */
 .k-tech{color:var(--term-dim)}                  /* technical detail stays quiet */
 .k-turn{color:var(--term-cyan)}                 /* this page was turned */
 .k-warn{color:var(--term-ink)}                  /* kept for old lines; reads as plain */
@@ -340,7 +346,8 @@ a.dl{display:inline-block;padding:8px 13px;background:var(--accent-soft);
   .split{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr)}
   .split>.right{border-left:1px solid var(--line);border-top:0}
 }
-.split>.right{border-top:1px solid var(--line);display:flex;flex-direction:column}
+.split>.right{border-top:1px solid var(--line);display:flex;flex-direction:column;
+              min-height:clamp(430px,62vh,820px)}
 [dir=rtl] .warnbox{border-left:0;border-right:3px solid var(--warn)}
 [dir=rtl] .hint{margin:-2px 24px 8px 0}
 </style>
@@ -404,9 +411,9 @@ a.dl{display:inline-block;padding:8px 13px;background:var(--accent-soft);
       <div class=plabel style=margin-bottom:0><span class=eyebrow data-t=s_rec></span><i></i>
         <span class="chip wait" id=reclive data-t=idlechip></span></div>
     </div>
-    <div class=term style=flex:1>
+    <div class=term>
       <div class=head><span id=termfile data-t=idle></span><span id=termcount></span></div>
-      <div class=body id=log></div>
+      <div class=scroll><div class=body id=log></div></div>
     </div>
   </div>
 </div></div></div>
@@ -830,7 +837,10 @@ def selftest():
     assert "const esc=" in PAGE and "esc(r.name)" in PAGE      # names are escaped
     assert "pollFails" in PAGE                                # a dead poll unlocks
     assert "a run is in progress" in open(__file__, encoding="utf-8").read()
-    assert "--term-green" not in PAGE and "--term-amber" not in PAGE  # four colours total
+    assert "--term-amber" not in PAGE                  # green is only the final line
+    assert ".k-done{color:var(--term-green)" in PAGE
+    assert "height:clamp(300px" not in PAGE            # the log fills its column now
+    assert ".term .scroll{position:relative" in PAGE   # content cannot stretch the column
     assert classify("   1 [tesseract] Too few characters. Skipping this page")[1] == "plain"
     for key in ("title", "o_redo", "w_body", "l_both", "q_run", "h_verbose", "remove"):
         assert f"{key}:" in PAGE, key
