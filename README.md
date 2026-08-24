@@ -8,6 +8,10 @@ Nothing is installed. No admin rights, no Python on the machine, nothing added
 to PATH or the registry. Download, extract, double-click. Delete the folder and
 it is gone.
 
+The launcher permits its bundled PowerShell GUI only for that running process;
+it does not change the computer's permanent PowerShell policy. A company Group
+Policy can still block it, in which case the startup report says so.
+
 English and Arabic. The interface is available in both.
 
 ## Get it
@@ -16,16 +20,18 @@ Click "Code" then "Download ZIP", and extract the folder somewhere on disk.
 
 ## Use it
 
-Double-click `START OCR.bat`. A black window opens and stays open - that is
-the program, leave it running. The tool itself opens in your browser.
+Double-click `START OCR.bat`. A startup-check window opens first and then the
+Windows-native Document OCR window opens. Leave the startup window open while
+you work.
 
-    1. Drag PDFs onto the page
+    1. Drag PDFs onto the window, or press Add PDFs
     2. Choose the folder where results should go
     3. Press Start OCR
-    4. Press Save to folder
+    4. Press Open output folder when processing finishes
 
 Your original files are never changed. Results are saved as `NAME_ocr.pdf`.
-Closing the black window shuts everything down.
+The app processes the queue one file at a time and continues if one file
+fails. Closing the app while OCR is running asks before cancelling it.
 
 ## Options
 
@@ -48,7 +54,9 @@ Closing the black window shuts everything down.
 
 ## If something goes wrong
 
-Run `system\diagnostics\Self test.bat`. It runs six checks and ends with a
+`START OCR.bat` checks every required component before opening the app and
+saves a readable `OCR native startup report.txt` if anything fails. Run
+`system\diagnostics\Self test.bat` for deeper checks; it ends with a
 real OCR of a test page, so it tells you what is broken rather than guessing.
 
 For a large batch with no window at all, drag files onto
@@ -64,8 +72,8 @@ no Windows machine is needed.
 
 ## What is inside, and its licensing
 
-This project is a wrapper. The scripts here add a browser interface, Arabic
-language data, and a step that turns pages upright before reading them. The
+This project is a wrapper. The scripts here add a Windows Forms interface,
+Arabic language data, and a step that turns pages upright before reading them. The
 programs that do the actual work are unmodified copies of other people's
 software, redistributed under their own licences:
 

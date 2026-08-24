@@ -6,25 +6,25 @@ Nothing is installed. Delete this folder and it is gone.
 
 TO USE IT
   Double-click  START OCR.bat
-  A black window opens and stays open - that is the program, leave it running.
-  Your browser opens on the tool:
+  A startup-check window opens and stays open; leave it running.
+  The Windows-native Document OCR app opens:
 
-      1. drag PDFs onto the page
+      1. drag PDFs onto the window, or press Add PDFs
       2. choose where results should go
       3. press Start OCR
-      4. press Save to folder
+      4. press Open output folder when finished
 
   Originals are never modified. Close the black window when finished.
 
 OPTIONS
-  Every option has an (i) next to it that explains what it does.
   Document language   English, English + Arabic, or Arabic only.
   Auto-rotate pages   fixes pages scanned sideways or upside down. On by default.
   Redo OCR            use when the file already has a wrong text layer.
   Show technical detail  shows the internal processing log.
 
 IF SOMETHING GOES WRONG
-  system\diagnostics\Self test.bat  runs six checks and ends with a real OCR.
+  START OCR.bat checks every required component and saves a readable report.
+  system\diagnostics\Self test.bat runs deeper checks and ends with a real OCR.
   system\diagnostics\OCR without the GUI (drag PDFs here).bat  processes a batch
   with no window at all - useful for a large folder.
 
