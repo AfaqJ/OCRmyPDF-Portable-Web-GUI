@@ -118,7 +118,7 @@ echo Checking: %~1
 >>"%REPORT%" echo ===== %~1 =====
 set "CHECK_NAME=%~1"
 shift
-%* >>"%REPORT%" 2>&1
+%1 %2 %3 %4 %5 %6 %7 %8 %9 >>"%REPORT%" 2>&1
 if not errorlevel 1 (
   echo OK: %CHECK_NAME%
   >>"%REPORT%" echo RESULT: OK - %CHECK_NAME%
