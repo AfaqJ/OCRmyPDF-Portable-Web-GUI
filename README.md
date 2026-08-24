@@ -1,100 +1,94 @@
-# OCRmyPDF Portable — Web GUI
+# Document OCR (portable, Windows 64-bit)
 
-Makes scanned PDFs searchable by adding an invisible text layer. Built for a
-locked-down corporate Windows PC: **no installer, no admin rights, no Python on the
-machine, nothing added to PATH or the registry.** Download, extract, double-click.
+Makes scanned PDFs searchable by adding an invisible text layer behind the
+scan. The page still looks exactly the same; the text can now be selected,
+copied, searched, and indexed by SharePoint.
 
-English and Arabic interface, switchable from the top bar. Pages scanned sideways or
-upside down are turned upright automatically, and a run can be cancelled part way
-without losing the queue.
+Nothing is installed. No admin rights, no Python on the machine, nothing added
+to PATH or the registry. Download, extract, double-click. Delete the folder and
+it is gone.
 
-The window is a two-pane console: documents, destination and settings on the left, a
-live log on the right. The log carries the page numbers in a gutter and uses
-colour to mean something — cyan for a page that was turned and the confidence behind
-it, amber for one left alone, green for finished, red for failed.
+English and Arabic. The interface is available in both.
+
+## Get it
+
+Click "Code" then "Download ZIP", and extract the folder somewhere on disk.
 
 ## Use it
 
-**Code → Download ZIP**, extract, double-click **`START OCR.bat`**. A console window
-opens and stays open — that is the program — and the tool appears in your browser.
+Double-click `START OCR.bat`. A black window opens and stays open - that is
+the program, leave it running. The tool itself opens in your browser.
 
-Drag PDFs onto the page → choose a save folder → Start OCR → Save to folder.
+    1. Drag PDFs onto the page
+    2. Choose the folder where results should go
+    3. Press Start OCR
+    4. Press Save to folder
 
-```
-START OCR.bat          the launcher, the only thing to click
-app/                   Python 3.12, Tesseract 5.5.3, Ghostscript 10.07.1, OCRmyPDF 17.10.0
-system/                web_gui.py and env.bat
-system/diagnostics/    self test, and a no-GUI batch runner
-```
+Your original files are never changed. Results are saved as `NAME_ocr.pdf`.
+Closing the black window shuts everything down.
 
-## Why the GUI is a web page
+## Options
 
-The Tk version would not load on the target machine: `_tkinter.pyd` failed with
-`%1 is not a valid Win32 application` with every Tcl/Tk DLL present, correct and
-64-bit. So the GUI moved to `http.server` — Python's own standard library — serving
-one page on `127.0.0.1`. No framework, no dependency, no build step. One file:
-[`system/web_gui.py`](system/web_gui.py).
+    Document language      English, English + Arabic, or Arabic.
+    Auto-rotate pages      Turns sideways and upside-down scans upright
+                           before reading them. On by default.
+    Redo OCR               For files that already have a wrong text layer.
+                           Off means pages holding real text are left alone.
+    Show technical detail  Puts every internal step in the log.
 
-## Rebuilding the runtime
+## Good to know
 
-```bash
-./build_bundle.sh
-```
+    - Pages with almost no text (a drawing, a stamp) cannot be checked for
+      orientation, so they are left exactly as they are.
+    - English + Arabic reads every page twice, once per script. It is slower,
+      and Arabic on scans is read less accurately than English.
+    - Arabic text is stored in the page in visual order, so searching for an
+      exact Arabic phrase may not match. English is not affected.
+    - Expect a few seconds per page. All processor cores are used.
 
-Runs on macOS or Linux. `micromamba --platform win-64` unpacks prebuilt Windows
-binaries and `pip --platform win_amd64` fetches prebuilt cp312 wheels. Nothing is
-compiled and no Windows machine is involved.
+## If something goes wrong
 
-## Three things that cost real time
+Run `system\diagnostics\Self test.bat`. It runs six checks and ends with a
+real OCR of a test page, so it tells you what is broken rather than guessing.
 
-**Tesseract's config files live in a different tree from its language data.**
-conda-forge puts `eng.traineddata` in `app/share/tessdata` but `configs/` in
-`app/Library/share/tessdata`. `TESSDATA_PREFIX` points at one directory, and
-OCRmyPDF always calls tesseract with the `hocr` config — so OCR dies with
-`read_params_file: Can't open hocr` while `--list-langs` works perfectly.
+For a large batch with no window at all, drag files onto
+`system\diagnostics\OCR without the GUI (drag PDFs here).bat`.
 
-**Python 3.8+ ignores `PATH` for extension-module dependencies.** Only the directory
-holding the `.pyd`, the system directories, and paths added via
-`os.add_dll_directory()` are searched.
+## Rebuilding the bundled programs
 
-**`--rotate-pages` puts the text layer in the wrong place.** Not always — only when
-the incoming page already carries a `/Rotate` flag, which is what most scanners
-produce. The page is turned correctly and looks right; the invisible text lands
-where the words used to be. Measured on a real scan, page rendered at 150 dpi:
+    ./build_bundle.sh
 
-| input page | median distance between a word and its text | words matched |
-|---|---|---|
-| upright | 2.8 px | 182 / 185 |
-| sideways, no flag | 2.7 px | 176 / 181 |
-| upside down, no flag | 2.8 px | 184 / 185 |
-| **sideways, with a `/Rotate` flag** | **830.5 px** | **5 / 181** |
+Runs on macOS or Linux. It downloads the official Windows builds and the
+matching Python packages and arranges them in `app\`. Nothing is compiled and
+no Windows machine is needed.
 
-So [`system/prerotate.py`](system/prerotate.py) turns each page upright *first*, and
-OCRmyPDF is then run without `--rotate-pages` on a page that is already the right way
-up. Only `/Rotate` is changed; the scanned pixels are untouched. That brings the last
-row back to 2.7 px and 176 of 181 words.
+## What is inside, and its licensing
 
-**Orientation detection abstains on sparse pages.** Tesseract reports an angle and a
-confidence, and the confidence tracks how much text is on the page rather than how sure
-the angle is — dense contract pages score 26–34, drawing sheets 0.7–1.9, and pages that
-are nearly all diagram return no angle at all. Across 11 test pages the angle was
-correct even at the bottom of that range, so `prerotate.py` acts on any angle offered
-and leaves the no-angle pages exactly as they are. Guessing those was tried and
-measured: OCRing all four orientations and keeping the best-scoring one picked the
-wrong way up on pages carrying a single label, so it was removed. A page with almost no
-text is left alone rather than turned at random.
+This project is a wrapper. The scripts here add a browser interface, Arabic
+language data, and a step that turns pages upright before reading them. The
+programs that do the actual work are unmodified copies of other people's
+software, redistributed under their own licences:
 
-## Limitations
+    OCRmyPDF 17.10.0     MPL-2.0        the OCR pipeline
+    Tesseract 5.5.3      Apache-2.0     the OCR engine
+    Ghostscript 10.07.1  AGPL-3.0       PDF processing
+    Python 3.12          PSF            runs everything
+    pikepdf, Pillow, pypdfium2, lxml and others
+                         MPL-2.0, MIT, BSD, Apache-2.0
+    fpdf2, img2pdf       LGPL-3.0       used by OCRmyPDF
+    Language data        Apache-2.0     from the Tesseract project
 
-- English and Arabic only. Other languages need the matching `.traineddata` in
-  `app/share/tessdata`.
-- Arabic accuracy on scans is lower than English.
-- A page with almost no text gives the orientation detector nothing to work with and
-  is left alone.
-- Windows x64 only.
+Full licence texts and the list of sources are in `licenses\`.
 
-## Licence
+Ghostscript is the one to be aware of. Artifex publishes it under the GNU
+Affero General Public License, or a paid commercial licence. Passing this
+bundle to anyone else counts as redistribution, so the AGPL terms travel with
+it, including the requirement that the source code stays available. The copy
+here is unmodified and its source is published at
+https://ghostscript.com/releases/ . If this is ever built into a product that
+is sold, or offered as a service to people outside the organisation, read the
+AGPL first or buy the commercial licence from Artifex.
 
-Scripts here are MIT. Bundled components keep their own licences — OCRmyPDF
-(MPL-2.0), Tesseract (Apache-2.0), Ghostscript (AGPL-3.0), Python (PSF). Read
-Ghostscript's AGPL before redistributing a built bundle.
+The scripts written for this project (`START OCR.bat`, everything in
+`system\`, and `build_bundle.sh`) are released under the MIT licence. They call
+the bundled programs as separate programs and do not modify them.

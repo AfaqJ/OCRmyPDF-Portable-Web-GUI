@@ -37,6 +37,8 @@ curl -Ls -o "$APP/share/tessdata/ara.traineddata" \
 # interpreter still imports it in places.)
 cp "$APP/Library/bin/"{tcl86t.dll,tk86t.dll,zlib1.dll} "$APP/DLLs/"
 
+# NB: keep any LICENSE/COPYING files. Stripping them would breach the AGPL and
+# Apache terms the bundled programs are redistributed under.
 rm -rf "$APP"/{include,conda-meta,man} "$APP/Library/include" \
        "$APP/Lib"/{test,idlelib,ensurepip}
 find "$APP" \( -name '*.lib' -o -name '*.a' -o -name '*.pdb' \) -delete
