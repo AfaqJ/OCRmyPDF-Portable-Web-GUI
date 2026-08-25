@@ -64,6 +64,15 @@ function Write-Report($Report, [string]$Text) {
     if ($Report) { $Report.WriteLine($Text.TrimEnd()); $Report.Flush() }
 }
 
+# Progress is one shared counter (script scope, no closures -- closures get
+# their own module scope in PowerShell, which silently breaks the count).
+$script:Done = 0
+$script:TotalUnits = 1
+function Update-Progress {
+    $script:Done++
+    Emit 'progress' @{ value = [Math]::Min(99, [int]($script:Done * 100 / $script:TotalUnits)) }
+}
+
 # --- small helpers (pure -> unit tested) -----------------------------------
 function Get-NextTarget([string]$Folder, [string]$SourcePath) {
     $stem = [IO.Path]::GetFileNameWithoutExtension($SourcePath)
@@ -100,19 +109,30 @@ function Resolve-Lang([string]$Lang) {
 }
 
 # --- engine calls ----------------------------------------------------------
+function ConvertTo-CmdArg([string]$Value) {
+    # Quote an argument for ProcessStartInfo.Arguments (Windows PowerShell 5.1
+    # has no ArgumentList). Enough for our file paths and flags.
+    if ($Value -eq '' -or $Value -match '[\s"]') {
+        return '"' + ($Value -replace '"', '\"') + '"'
+    }
+    return $Value
+}
+
 function Invoke-Engine([string]$Exe, [string[]]$EngineArgs) {
     # Run a bundled exe, capture stdout+stderr, no visible window.
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
+    $psi.Arguments = (($EngineArgs | ForEach-Object { ConvertTo-CmdArg $_ }) -join ' ')
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    foreach ($a in $EngineArgs) { $psi.ArgumentList.Add($a) }
     $p = [Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
+    # Read stdout async so a full stderr buffer can't deadlock the child.
+    $outTask = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEnd()
     $p.WaitForExit()
+    $out = $outTask.Result
     return @{ code = $p.ExitCode; out = $out; err = $err }
 }
 
@@ -190,7 +210,7 @@ function Invoke-OneDocument {
     param(
         [int]$Index, [string]$Source, [int]$Pages, [string]$OutputDir,
         [string]$JobDir, [string]$Lang, [bool]$Rotate, [int]$Dpi,
-        $Report, [scriptblock]$Bump
+        $Report
     )
     Emit 'file' @{ index = $Index; state = 'running'; pages = $Pages; page = 0 }
     Emit 'log'  @{ kind = 'head'; text = "$([IO.Path]::GetFileName($Source)) - $Pages page(s)" }
@@ -209,22 +229,22 @@ function Invoke-OneDocument {
             $o = Get-Orientation $png
             if ($o.turn) {
                 Set-ImageRotation $png $o.turn
-                Emit 'log' @{ kind = 'turn'; text = "Page $p: turned $($o.turn) degrees clockwise - $($o.why)" }
+                Emit 'log' @{ kind = 'turn'; text = "Page ${p}: turned $($o.turn) degrees clockwise - $($o.why)" }
                 Write-Report $Report "   page ${p}: turned $($o.turn) deg clockwise ($($o.why))"
             } else {
                 Emit 'log' @{ kind = 'dim'; text = "Page ${p}: $($o.why)" }
                 Write-Report $Report "   page ${p}: left upright ($($o.why))"
             }
-            & $Bump
+            Update-Progress
         }
 
         $images.Add($png)
         Emit 'file' @{ index = $Index; state = 'running'; pages = $Pages; page = $p }
         Emit 'stage' @{ text = "$([IO.Path]::GetFileName($Source)) - reading page $p of $Pages" }
-        & $Bump
+        Update-Progress
     }
 
-    Emit 'stage' @{ text = "$([IO.Path]::GetFileName($Source)) - building searchable PDF" }
+    Emit (STAGEPLACEHOLDER) searchable PDF" }
     $ocr = Invoke-TesseractPdf $images.ToArray() (Join-Path $pageDir 'out') $Lang $Dpi
 
     $target = Get-NextTarget $OutputDir $Source
@@ -266,12 +286,9 @@ function Invoke-Run([hashtable]$Job) {
     }
 
     $perPage = if ($rotate) { 2 } else { 1 }
-    $totalUnits = [Math]::Max(1, ($valid | ForEach-Object { $_.pages * $perPage } | Measure-Object -Sum).Sum)
+    $sum = ($valid | ForEach-Object { $_.pages * $perPage } | Measure-Object -Sum).Sum
+    $script:TotalUnits = [Math]::Max(1, [int]$sum)
     $script:Done = 0
-    $bump = {
-        $script:Done++
-        Emit 'progress' @{ value = [Math]::Min(99, [int]($script:Done * 100 / $totalUnits)) }
-    }.GetNewClosure()
 
     $report = $null
     if ($Job.ContainsKey('report_path') -and $Job.report_path) {
@@ -287,7 +304,7 @@ function Invoke-Run([hashtable]$Job) {
             try {
                 Invoke-OneDocument -Index $v.index -Source $v.source -Pages $v.pages `
                     -OutputDir $outputDir -JobDir $jobDir -Lang $lang -Rotate $rotate -Dpi $dpi `
-                    -Report $report -Bump $bump
+                    -Report $report
                 $succeeded++
             } catch {
                 $failed++
@@ -336,6 +353,9 @@ function Invoke-SelfTest {
     Check 'osd parse conf' ([Math]::Abs($osd.conf - 12.34) -lt 0.001)
     $none = ConvertFrom-OsdOutput "Too few characters"
     Check 'osd parse empty -> 0/0' ($none.turn -eq 0 -and $none.conf -eq 0.0)
+
+    Check 'quote plain' ((ConvertTo-CmdArg 'abc') -eq 'abc')
+    Check 'quote spaces' ((ConvertTo-CmdArg 'a b') -eq '"a b"')
 
     Check 'rotate 90'  ((Get-RotateFlip 90)  -eq [Drawing.RotateFlipType]::Rotate90FlipNone)
     Check 'rotate 180' ((Get-RotateFlip 180) -eq [Drawing.RotateFlipType]::Rotate180FlipNone)
