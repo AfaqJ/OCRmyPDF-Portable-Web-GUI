@@ -33,7 +33,10 @@ param(
     [Parameter(ParameterSetName = 'One')][string]$OutDir,
     [Parameter(ParameterSetName = 'One')][string]$Lang = 'eng+ara',
     [Parameter(ParameterSetName = 'Self')][switch]$SelfTest,
-    [int]$Dpi = 300
+    [int]$Dpi = 300,
+    # auto = lossless Path B when the PDF library loads, else Path A;
+    # A = force rasterize path; B = force lossless path (still falls back per doc).
+    [ValidateSet('auto', 'A', 'B')][string]$Mode = 'auto'
 )
 
 Set-StrictMode -Version 2.0
@@ -48,6 +51,8 @@ $env:TESSDATA_PREFIX = (Join-Path $App 'share\tessdata')
 
 $script:LangMap = @{ 'eng' = 'eng'; 'eng+ara' = 'eng+ara'; 'ara' = 'ara' }
 $script:OsdConfidenceFloor = 0.01   # matches prerotate.py: act on any angle offered
+$script:PdfLib = Join-Path $PSScriptRoot 'lib\PdfSharp.dll'
+$script:PdfLibLoaded = $false
 
 # --- event emission --------------------------------------------------------
 $script:EventWriter = $null
@@ -255,6 +260,109 @@ function Invoke-OneDocument {
     Write-Report $Report "Saved: $target"
 }
 
+# --- Path B: lossless assembly via PDFsharp --------------------------------
+function Test-PdfLibrary {
+    # Load the .NET PDF library once. Returns $false if it is missing or the
+    # machine refuses it -- the caller then uses Path A.
+    if ($script:PdfLibLoaded) { return $true }
+    try {
+        if (-not (Test-Path -LiteralPath $script:PdfLib)) { return $false }
+        # Load from bytes, not LoadFrom: a downloaded DLL may carry mark-of-the-web,
+        # which makes Assembly.LoadFrom refuse it. Bytes have no file zone.
+        $bytes = [IO.File]::ReadAllBytes($script:PdfLib)
+        [Reflection.Assembly]::Load($bytes) | Out-Null
+        $null = [PdfSharp.Pdf.PdfDocument]   # fails if the assembly did not load
+        $script:PdfLibLoaded = $true
+        return $true
+    } catch { return $false }
+}
+
+function Test-PageHasText([string]$Pdf, [int]$Page, [string]$WorkDir) {
+    # A page already carrying a real text layer (born-digital) needs no OCR.
+    # Ghostscript's txtwrite extracts it; any letters/digits => it has text.
+    $txt = Join-Path $WorkDir "text$Page.txt"
+    $r = Invoke-Engine $script:Ghostscript @(
+        '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER', '-sDEVICE=txtwrite',
+        "-dFirstPage=$Page", "-dLastPage=$Page", '-o', $txt, $Pdf
+    )
+    if ($r.code -ne 0 -or -not (Test-Path -LiteralPath $txt)) { return $false }
+    $content = Get-Content -LiteralPath $txt -Raw -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $txt -Force -ErrorAction SilentlyContinue
+    return ($content -and ($content -match '[A-Za-z0-9]'))
+}
+
+function Convert-SinglePageToPdf {
+    # OCR one page to a one-page searchable PDF (render -> OSD rotate -> tesseract).
+    param([string]$Source, [int]$Page, [string]$WorkDir, [string]$Lang, [bool]$Rotate, [int]$Dpi, $Report)
+    $png = Join-Path $WorkDir ("page{0:D4}.png" -f $Page)
+    Export-PageImage $Source $Page $png $Dpi
+    if ($Rotate) {
+        $o = Get-Orientation $png
+        if ($o.turn) {
+            Set-ImageRotation $png $o.turn
+            Emit 'log' @{ kind = 'turn'; text = "Page ${Page}: turned $($o.turn) degrees clockwise - $($o.why)" }
+            Write-Report $Report "   page ${Page}: turned $($o.turn) deg clockwise ($($o.why))"
+        } else {
+            Emit 'log' @{ kind = 'dim'; text = "Page ${Page}: $($o.why)" }
+        }
+    }
+    return (Invoke-TesseractPdf @($png) (Join-Path $WorkDir "p$Page") $Lang $Dpi)
+}
+
+function Invoke-OneDocumentLossless {
+    # Path B: keep pages that already have text untouched (lossless); OCR only
+    # the scanned pages; assemble everything into one PDF with PDFsharp.
+    param(
+        [int]$Index, [string]$Source, [int]$Pages, [string]$OutputDir,
+        [string]$JobDir, [string]$Lang, [bool]$Rotate, [bool]$Redo, [int]$Dpi, $Report
+    )
+    Emit 'file' @{ index = $Index; state = 'running'; pages = $Pages; page = 0 }
+    Emit 'log'  @{ kind = 'head'; text = "$([IO.Path]::GetFileName($Source)) - $Pages page(s)" }
+    Write-Report $Report "`n===== $Source (lossless path) ====="
+
+    $pageDir = Join-Path $JobDir "docB$Index"
+    [IO.Directory]::CreateDirectory($pageDir) | Out-Null
+    $perPage = if ($Rotate) { 2 } else { 1 }
+
+    $reader = [PdfSharp.Pdf.IO.PdfReader]::Open($Source, [PdfSharp.Pdf.IO.PdfDocumentOpenMode]::Import)
+    $output = New-Object PdfSharp.Pdf.PdfDocument
+    $ocrDocs = New-Object Collections.Generic.List[object]
+    try {
+        for ($p = 1; $p -le $Pages; $p++) {
+            $hasText = (-not $Redo) -and (Test-PageHasText $Source $p $pageDir)
+            if ($hasText) {
+                [void]$output.AddPage($reader.Pages[$p - 1])   # untouched, lossless
+                Emit 'log' @{ kind = 'dim'; text = "Page ${p}: already has text - kept unchanged" }
+                Write-Report $Report "   page ${p}: already has text - kept unchanged"
+            } else {
+                Emit 'stage' @{ text = "$([IO.Path]::GetFileName($Source)) - reading page $p of $Pages" }
+                $onePdf = Convert-SinglePageToPdf -Source $Source -Page $p -WorkDir $pageDir `
+                    -Lang $Lang -Rotate $Rotate -Dpi $Dpi -Report $Report
+                $ocrDoc = [PdfSharp.Pdf.IO.PdfReader]::Open($onePdf, [PdfSharp.Pdf.IO.PdfDocumentOpenMode]::Import)
+                $ocrDocs.Add($ocrDoc)
+                [void]$output.AddPage($ocrDoc.Pages[0])
+            }
+            Emit 'file' @{ index = $Index; state = 'running'; pages = $Pages; page = $p }
+            for ($u = 0; $u -lt $perPage; $u++) { Update-Progress }
+        }
+
+        Emit 'stage' @{ text = "$([IO.Path]::GetFileName($Source)) - saving searchable PDF" }
+        $staged = Join-Path $pageDir 'assembled.pdf'
+        $output.Save($staged)
+    } finally {
+        foreach ($d in $ocrDocs) { try { $d.Close() } catch {} }
+        try { $output.Close() } catch {}
+        try { $reader.Close() } catch {}
+    }
+
+    $target = Get-NextTarget $OutputDir $Source
+    Publish-Output $staged $target
+    Emit 'file'   @{ index = $Index; state = 'done'; pages = $Pages; page = $Pages }
+    Emit 'result' @{ index = $Index; path = $target }
+    Emit 'log'    @{ kind = 'ok'; text = "Saved: $target" }
+    Write-Report $Report "Saved: $target"
+}
+
 # --- the run ---------------------------------------------------------------
 function Invoke-Run([hashtable]$Job) {
     $opts = $Job.options
@@ -262,7 +370,9 @@ function Invoke-Run([hashtable]$Job) {
     $jobDir    = $Job.job_dir
     $lang      = Resolve-Lang $opts.lang
     $rotate    = [bool]$opts.rotate
+    $redo      = if ($opts.ContainsKey('redo')) { [bool]$opts.redo } else { $false }
     $dpi       = if ($opts.ContainsKey('dpi')) { [int]$opts.dpi } else { $Dpi }
+    $mode      = if ($opts.ContainsKey('mode')) { [string]$opts.mode } else { $Mode }
 
     if (-not (Test-Path -LiteralPath $outputDir -PathType Container)) {
         Emit 'fatal' @{ text = "Output folder does not exist: $outputDir" }; return 2
@@ -298,13 +408,38 @@ function Invoke-Run([hashtable]$Job) {
         Write-Report $report ("Options: lang=$lang rotate=$rotate dpi=$dpi")
     }
 
+    # Decide the path. Path B (lossless) needs the PDF library to load.
+    $useB = $false
+    if ($mode -ne 'A') {
+        if (Test-PdfLibrary) { $useB = $true }
+        elseif ($mode -eq 'B') {
+            Emit 'log' @{ kind = 'bad'; text = 'PDF library did not load; using the rasterize path.' }
+        }
+    }
+    Write-Report $report ("Path: {0}" -f $(if ($useB) { 'B (lossless)' } else { 'A (rasterize)' }))
+
     $succeeded = 0; $failed = 0
     try {
         foreach ($v in $valid) {
             try {
-                Invoke-OneDocument -Index $v.index -Source $v.source -Pages $v.pages `
-                    -OutputDir $outputDir -JobDir $jobDir -Lang $lang -Rotate $rotate -Dpi $dpi `
-                    -Report $report
+                if ($useB) {
+                    try {
+                        Invoke-OneDocumentLossless -Index $v.index -Source $v.source -Pages $v.pages `
+                            -OutputDir $outputDir -JobDir $jobDir -Lang $lang -Rotate $rotate `
+                            -Redo $redo -Dpi $dpi -Report $report
+                    } catch {
+                        # Any lossless-path failure falls back to the reliable rasterize path.
+                        Emit 'log' @{ kind = 'dim'; text = "Lossless path failed ($($_.Exception.Message)); using rasterize fallback." }
+                        Write-Report $report ("Lossless path failed: " + ($_ | Out-String))
+                        Invoke-OneDocument -Index $v.index -Source $v.source -Pages $v.pages `
+                            -OutputDir $outputDir -JobDir $jobDir -Lang $lang -Rotate $rotate -Dpi $dpi `
+                            -Report $report
+                    }
+                } else {
+                    Invoke-OneDocument -Index $v.index -Source $v.source -Pages $v.pages `
+                        -OutputDir $outputDir -JobDir $jobDir -Lang $lang -Rotate $rotate -Dpi $dpi `
+                        -Report $report
+                }
                 $succeeded++
             } catch {
                 $failed++
@@ -374,6 +509,9 @@ function Invoke-SelfTest {
 
     Check 'tesseract present' (Test-Path -LiteralPath $script:Tesseract)
     Check 'ghostscript present' (Test-Path -LiteralPath $script:Ghostscript)
+    # Path B is optional: report whether the PDF library loads, but never fail on it.
+    if (Test-PdfLibrary) { Write-Host '  ok  - PDF library (Path B available)' }
+    else { Write-Host '  info- PDF library not loaded (Path A fallback will be used)' }
 
     if ($script:selfFail -eq 0) { Write-Host 'native worker (Path A) selftest ok'; return 0 }
     Write-Host "native worker selftest FAILED ($script:selfFail)"; return 1
@@ -388,7 +526,7 @@ switch ($PSCmdlet.ParameterSetName) {
             inputs = @($InputPdf); output_dir = $OutDir
             job_dir = (Join-Path ([IO.Path]::GetTempPath()) ('document_ocr_' + [Guid]::NewGuid().ToString('N')))
             report_path = $null
-            options = @{ lang = $Lang; rotate = $true; redo = $false; verbose = $false; dpi = $Dpi }
+            options = @{ lang = $Lang; rotate = $true; redo = $false; verbose = $false; dpi = $Dpi; mode = $Mode }
         }
         exit (Invoke-Run $job)
     }
