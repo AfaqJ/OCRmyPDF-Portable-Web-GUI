@@ -244,7 +244,7 @@ function Invoke-OneDocument {
         Update-Progress
     }
 
-    Emit (STAGEPLACEHOLDER) searchable PDF" }
+    Emit 'stage' @{ text = "$([IO.Path]::GetFileName($Source)) - building searchable PDF" }
     $ocr = Invoke-TesseractPdf $images.ToArray() (Join-Path $pageDir 'out') $Lang $Dpi
 
     $target = Get-NextTarget $OutputDir $Source
