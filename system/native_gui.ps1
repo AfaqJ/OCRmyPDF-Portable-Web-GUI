@@ -9,14 +9,13 @@ Add-Type -AssemblyName System.Drawing
 
 $Root = Split-Path -Parent $PSScriptRoot
 $App = Join-Path $Root 'app'
-$Python = Join-Path $App 'python.exe'
-$Worker = Join-Path $PSScriptRoot 'native_worker.py'
-$OcrEntry = Join-Path $PSScriptRoot 'socketless_ocr.py'
+$PowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$Worker = Join-Path $PSScriptRoot 'native_worker.ps1'
 $Strings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'native_strings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $RunReport = Join-Path $Root 'OCR native run report.txt'
 
 if ($SelfTest) {
-    foreach ($required in @($Python, $Worker, $OcrEntry, (Join-Path $PSScriptRoot 'native_strings.json'))) {
+    foreach ($required in @($PowerShell, $Worker, (Join-Path $PSScriptRoot 'native_strings.json'))) {
         if (-not [IO.File]::Exists($required)) { throw "Missing required file: $required" }
     }
     if ($null -eq $Strings.en -or $null -eq $Strings.ar) {
@@ -526,8 +525,8 @@ function Start-Run {
     $script:EventReader = New-Object IO.StreamReader($eventFile, [Text.Encoding]::UTF8, $true)
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $Python
-    $startInfo.Arguments = "-X utf8 -s -u `"$Worker`" --config `"$configPath`" --events `"$eventPath`""
+    $startInfo.FileName = $PowerShell
+    $startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Worker`" -Config `"$configPath`" -Events `"$eventPath`""
     $startInfo.WorkingDirectory = $PSScriptRoot
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
