@@ -23,8 +23,11 @@
   Every page costs one Ghostscript render, one Tesseract orientation check and
   one Tesseract OCR pass. That work is irreducible. What was reducible was the
   overhead wrapped around it:
-    - Ghostscript renders a batch of pages per process (-ChunkPages), not one
-      page per process, so a 350-page PDF is opened ~14 times instead of 350.
+    - Ghostscript renders a batch of pages per process (-ChunkPages, default
+      10), not one page per process, so a 350-page PDF is opened ~35 times
+      instead of 350. The batch is deliberately small: page log lines only
+      appear once their batch finishes, so a large batch makes the window look
+      frozen.
     - Several Tesseract processes run at once (-Jobs); Tesseract itself is one
       page per process and does not thread.
   None of this trades accuracy for speed: same engines, same resolution, same
@@ -61,7 +64,7 @@ param(
     [ValidateSet('auto', 'A', 'B')][string]$Mode = 'auto',
     # Speed knobs. 0 = pick from the core count. See "speed" note below.
     [int]$Jobs = 0,
-    [int]$ChunkPages = 25
+    [int]$ChunkPages = 10
 )
 
 Set-StrictMode -Version 2.0
@@ -177,7 +180,7 @@ function ConvertTo-CmdArg([string]$Value) {
     return $Value
 }
 
-function Invoke-EngineBatch([object[]]$Calls) {
+function Invoke-EngineBatch([object[]]$Calls, [string]$StagePrefix = '') {
     # Run several bundled-exe calls at once and return their results in the same
     # order. Tesseract handles one page per process and does not thread, so the
     # only way to use the machine's other cores is to run several pages at once.
@@ -185,6 +188,7 @@ function Invoke-EngineBatch([object[]]$Calls) {
     if ($Calls.Count -eq 0) { return @() }
     $results = New-Object 'object[]' $Calls.Count
     $i = 0
+    $finished = 0
     while ($i -lt $Calls.Count) {
         $running = New-Object Collections.Generic.List[object]
         while ($running.Count -lt $script:MaxParallel -and $i -lt $Calls.Count) {
@@ -209,6 +213,11 @@ function Invoke-EngineBatch([object[]]$Calls) {
             $b.proc.WaitForExit()
             $results[$b.index] = @{ code = $b.proc.ExitCode; out = $b.out.Result; err = $b.err.Result }
             $b.proc.Dispose()
+            $finished++
+            # Say something after every single page. Without this the window
+            # sits silent for a whole batch and looks frozen. A prefix, not a
+            # format string -- a file name containing a brace would break -f.
+            if ($StagePrefix) { Emit 'stage' @{ text = "$StagePrefix $finished/$($Calls.Count)" } }
         }
     }
     # Flat array of hashtables. Every caller wraps the result in @() so a
@@ -283,7 +292,7 @@ function ConvertTo-OrientationDecision([hashtable]$Osd) {
     return @{ turn = 0; why = 'too little text to tell which way up it is - left alone' }
 }
 
-function Get-OrientationBatch([string[]]$Pngs) {
+function Get-OrientationBatch([string[]]$Pngs, [string]$StagePrefix = '') {
     # The same `--psm 0` check as before, on the same full-resolution image --
     # several tesseract processes at a time instead of one after another.
     if ($Pngs.Count -eq 0) { return @() }
@@ -291,7 +300,7 @@ function Get-OrientationBatch([string[]]$Pngs) {
     foreach ($png in $Pngs) {
         $calls.Add(@{ exe = $script:Tesseract; engineArgs = @($png, 'stdout', '--psm', '0', '-l', 'osd') })
     }
-    $res = @(Invoke-EngineBatch $calls.ToArray())
+    $res = @(Invoke-EngineBatch $calls.ToArray() $StagePrefix)
     $out = New-Object 'object[]' $Pngs.Count
     for ($i = 0; $i -lt $Pngs.Count; $i++) {
         $out[$i] = ConvertTo-OrientationDecision (ConvertFrom-OsdOutput ($res[$i].out + $res[$i].err))
@@ -371,8 +380,7 @@ function Invoke-OneDocument {
         $pngs = @(Export-PageImages $Source $slice (Join-Path $pageDir ("c{0:D5}" -f $from)) $Dpi)
 
         if ($Rotate) {
-            Emit 'stage' @{ text = "$name - checking orientation, pages $from-$to of $Last" }
-            $turns = @(Get-OrientationBatch $pngs)
+            $turns = @(Get-OrientationBatch $pngs "$name - checking orientation, pages $from-${to}:")
             for ($k = 0; $k -lt $slice.Count; $k++) {
                 Set-PageOrientation $pngs[$k] $slice[$k] $turns[$k] $Report
                 Update-Progress
@@ -490,7 +498,7 @@ function Invoke-OneDocumentLossless {
         $pngs = @(Export-PageImages $Source $slice $chunkDir $Dpi)
 
         if ($Rotate) {
-            $turns = @(Get-OrientationBatch $pngs)
+            $turns = @(Get-OrientationBatch $pngs "$name - checking orientation from page $($slice[0]):")
             for ($k = 0; $k -lt $slice.Count; $k++) {
                 Set-PageOrientation $pngs[$k] $slice[$k] $turns[$k] $Report
             }
@@ -504,7 +512,7 @@ function Invoke-OneDocumentLossless {
                                '--dpi', "$Dpi", '-l', $Lang, 'pdf')
             })
         }
-        $res = @(Invoke-EngineBatch $calls.ToArray())
+        $res = @(Invoke-EngineBatch $calls.ToArray() "$name - reading from page $($slice[0]):")
         for ($k = 0; $k -lt $slice.Count; $k++) {
             $onePdf = (Join-Path $chunkDir ("p{0:D5}.pdf" -f $slice[$k]))
             if ($res[$k].code -ne 0 -or -not (Test-Path -LiteralPath $onePdf)) {

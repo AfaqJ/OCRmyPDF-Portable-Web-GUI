@@ -36,11 +36,15 @@ echo All startup checks passed.
 echo Opening Document OCR...
 >>"%REPORT%" echo.
 >>"%REPORT%" echo RESULT: All startup checks passed.
-"%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0system\native_gui.ps1" 2>>"%REPORT%"
-set "EXIT_CODE=%ERRORLEVEL%"
-if "%EXIT_CODE%"=="0" goto :end
->>"%REPORT%" echo RESULT: The OCR window exited with code %EXIT_CODE%.
-set "FAILURES=1"
+rem Hand the app to its own process and let this console close, so the user is
+rem left with only the OCR window. -WindowStyle Hidden suppresses the PowerShell
+rem host window; it does not hide the Windows Forms window, which native_gui.ps1
+rem shows itself. The console stays open only when a check above failed, which
+rem is exactly when its output is worth reading.
+rem Trade-off: this console no longer captures errors raised by the app after it
+rem starts. The Windows Forms self-test runs seconds earlier and covers loading.
+start "Document OCR" "%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0system\native_gui.ps1"
+goto :end
 
 :failed
 echo.
