@@ -11,7 +11,6 @@
     "language": "Document language",
     "rotate": "Correct page orientation",
     "redo": "Redo OCR (replace an existing text layer)",
-    "verbose": "Show technical details",
     "arabic_warning": "English + Arabic is slower and Arabic search accuracy is limited.",
     "output": "Output folder",
     "browse": "Browse",
@@ -35,7 +34,16 @@
     "cannot_write": "The output folder is not writable.",
     "confirm_close": "OCR is still running. Cancel it and close?",
     "finished": "Finished",
-    "interface": "Interface"
+    "interface": "Interface",
+    "pages": "Pages",
+    "pages_all": "All",
+    "range_button": "Page range...",
+    "range_title": "Page range",
+    "range_hint": "Choose which pages to read. Only these pages are processed and only they appear in the output file.",
+    "range_all": "All pages",
+    "range_from": "Pages",
+    "range_to": "to",
+    "range_ok": "Apply"
   },
   "ar": {
     "title": "التعرف الضوئي على المستندات",
@@ -49,7 +57,6 @@
     "language": "لغة المستند",
     "rotate": "تصحيح اتجاه الصفحات",
     "redo": "إعادة التعرف الضوئي واستبدال طبقة النص",
-    "verbose": "إظهار التفاصيل التقنية",
     "arabic_warning": "الإنجليزية والعربية أبطأ، ودقة البحث بالعربية محدودة.",
     "output": "مجلد الإخراج",
     "browse": "اختيار",
@@ -73,6 +80,15 @@
     "cannot_write": "لا يمكن الكتابة في مجلد الإخراج.",
     "confirm_close": "المعالجة ما زالت جارية. هل تريد إلغاءها والإغلاق؟",
     "finished": "اكتملت المعالجة",
-    "interface": "الواجهة"
+    "interface": "الواجهة",
+    "pages": "الصفحات",
+    "pages_all": "الكل",
+    "range_button": "نطاق الصفحات...",
+    "range_title": "نطاق الصفحات",
+    "range_hint": "اختر الصفحات المراد معالجتها. ستتم معالجة هذه الصفحات فقط وستظهر وحدها في الملف الناتج.",
+    "range_all": "كل الصفحات",
+    "range_from": "من",
+    "range_to": "إلى",
+    "range_ok": "تطبيق"
   }
 }

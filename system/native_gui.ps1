@@ -21,11 +21,22 @@ if ($SelfTest) {
     if ($null -eq $Strings.en -or $null -eq $Strings.ar) {
         throw 'The interface language file is incomplete.'
     }
-    Write-Output 'native GUI selftest ok - WinForms and language resources loaded'
+    # A key present in one language and missing in the other renders as a blank
+    # label at runtime rather than an error, so check both sets match.
+    $enKeys = @($Strings.en.PSObject.Properties.Name | Sort-Object)
+    $arKeys = @($Strings.ar.PSObject.Properties.Name | Sort-Object)
+    if ($enKeys.Count -ne $arKeys.Count -or (Compare-Object $enKeys $arKeys)) {
+        throw ('Interface text differs between languages: ' +
+               (@(Compare-Object $enKeys $arKeys | ForEach-Object { $_.InputObject }) -join ', '))
+    }
+    Write-Output "native GUI selftest ok - WinForms loaded, $($enKeys.Count) interface strings in both languages"
     exit 0
 }
 
 $script:InputPaths = New-Object 'System.Collections.Generic.List[string]'
+# One entry per input path, same order. @{first=0;last=0} means "the whole file";
+# 0 is used rather than $null so the worker needs no special case for "all".
+$script:PageRanges = New-Object 'System.Collections.Generic.List[object]'
 $script:Results = New-Object 'System.Collections.Generic.List[string]'
 $script:Running = $false
 $script:Cancelled = $false
@@ -75,7 +86,11 @@ $InterfaceChoice.Size = New-Object System.Drawing.Size(132, 28)
 $InterfaceChoice.Anchor = 'Top,Right'
 $InterfaceChoice.DropDownStyle = 'DropDownList'
 [void]$InterfaceChoice.Items.Add('English')
-[void]$InterfaceChoice.Items.Add('العربية')
+# Written in English on purpose. This file has no byte-order mark, so Windows
+# PowerShell 5.1 decodes it as the system ANSI codepage and any non-ASCII
+# literal here arrives as mojibake. Translated text belongs in
+# native_strings.json, which IS read as UTF-8.
+[void]$InterfaceChoice.Items.Add('Arabic')
 $InterfaceChoice.SelectedIndex = 0
 $Form.Controls.Add($InterfaceChoice)
 
@@ -101,9 +116,10 @@ $FileList.FullRowSelect = $true
 $FileList.MultiSelect = $true
 $FileList.HideSelection = $false
 $FileList.AllowDrop = $true
-[void]$FileList.Columns.Add('File', 184)
-[void]$FileList.Columns.Add('Folder', 222)
-[void]$FileList.Columns.Add('Status', 86)
+[void]$FileList.Columns.Add('File', 150)
+[void]$FileList.Columns.Add('Folder', 172)
+[void]$FileList.Columns.Add('Pages', 90)
+[void]$FileList.Columns.Add('Status', 80)
 $DocumentsGroup.Controls.Add($FileList)
 
 $AddButton = New-Object System.Windows.Forms.Button
@@ -124,9 +140,15 @@ $ClearButton.Size = New-Object System.Drawing.Size(90, 30)
 $ClearButton.Anchor = 'Bottom,Left'
 $DocumentsGroup.Controls.Add($ClearButton)
 
+$RangeButton = New-Object System.Windows.Forms.Button
+$RangeButton.Location = New-Object System.Drawing.Point(380, 248)
+$RangeButton.Size = New-Object System.Drawing.Size(134, 30)
+$RangeButton.Anchor = 'Bottom,Left'
+$DocumentsGroup.Controls.Add($RangeButton)
+
 $SettingsGroup = New-Object System.Windows.Forms.GroupBox
-$SettingsGroup.Location = New-Object System.Drawing.Point(24, 400)
-$SettingsGroup.Size = New-Object System.Drawing.Size(530, 170)
+$SettingsGroup.Location = New-Object System.Drawing.Point(24, 424)
+$SettingsGroup.Size = New-Object System.Drawing.Size(530, 146)
 $SettingsGroup.Anchor = 'Bottom,Left'
 $SettingsGroup.BackColor = [System.Drawing.Color]::White
 $Form.Controls.Add($SettingsGroup)
@@ -157,13 +179,8 @@ $RedoCheck.Location = New-Object System.Drawing.Point(16, 89)
 $RedoCheck.Size = New-Object System.Drawing.Size(480, 25)
 $SettingsGroup.Controls.Add($RedoCheck)
 
-$VerboseCheck = New-Object System.Windows.Forms.CheckBox
-$VerboseCheck.Location = New-Object System.Drawing.Point(16, 116)
-$VerboseCheck.Size = New-Object System.Drawing.Size(480, 25)
-$SettingsGroup.Controls.Add($VerboseCheck)
-
 $ArabicWarning = New-Object System.Windows.Forms.Label
-$ArabicWarning.Location = New-Object System.Drawing.Point(16, 142)
+$ArabicWarning.Location = New-Object System.Drawing.Point(16, 116)
 $ArabicWarning.Size = New-Object System.Drawing.Size(500, 22)
 $ArabicWarning.ForeColor = [System.Drawing.Color]::FromArgb(166, 94, 0)
 $ArabicWarning.Visible = $false
@@ -259,11 +276,11 @@ function Apply-Language {
     $AddButton.Text = $text.add
     $RemoveButton.Text = $text.remove
     $ClearButton.Text = $text.clear
+    $RangeButton.Text = $text.range_button
     $SettingsGroup.Text = $text.settings
     $LanguageLabel.Text = $text.language
     $RotateCheck.Text = $text.rotate
     $RedoCheck.Text = $text.redo
-    $VerboseCheck.Text = $text.verbose
     $ArabicWarning.Text = $text.arabic_warning
     $OutputGroup.Text = $text.output
     $BrowseButton.Text = $text.browse
@@ -276,7 +293,12 @@ function Apply-Language {
     }
     $FileList.Columns[0].Text = $text.file
     $FileList.Columns[1].Text = $text.folder
-    $FileList.Columns[2].Text = $text.status
+    $FileList.Columns[2].Text = $text.pages
+    $FileList.Columns[3].Text = $text.status
+    # "All pages" is translated, so the Pages column has to be redrawn.
+    for ($i = 0; $i -lt $FileList.Items.Count -and $i -lt $script:PageRanges.Count; $i++) {
+        $FileList.Items[$i].SubItems[2].Text = Get-RangeText $script:PageRanges[$i]
+    }
     $rtl = $script:InterfaceLanguage -eq 'ar'
     $Form.RightToLeft = if ($rtl) { 'Yes' } else { 'No' }
     $Form.RightToLeftLayout = $rtl
@@ -300,6 +322,131 @@ function Append-Log([string]$Text, [string]$Kind = 'plain') {
     $LogBox.ScrollToCaret()
 }
 
+function Get-RangeText($Range) {
+    # What the Pages column shows for one file.
+    if (-not $Range -or (-not $Range.first -and -not $Range.last)) { return (Get-TextSet).pages_all }
+    $from = if ($Range.first) { $Range.first } else { 1 }
+    if (-not $Range.last) { return "$from+" }
+    if ($Range.last -eq $from) { return "$from" }
+    return "$from-$($Range.last)"
+}
+
+function Show-PageRangeDialog($Current) {
+    # A small modal window, because a ListView cannot edit a sub-item in place
+    # and because one dialog can set the range for every selected file at once.
+    # Returns @{first;last} or $null if the user cancelled.
+    $text = Get-TextSet
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = $text.range_title
+    $dialog.ClientSize = New-Object System.Drawing.Size(400, 176)
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.Font = $Font
+    $dialog.BackColor = [System.Drawing.Color]::White
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Location = New-Object System.Drawing.Point(16, 14)
+    $hint.Size = New-Object System.Drawing.Size(368, 34)
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(91, 107, 123)
+    $hint.Text = $text.range_hint
+    $dialog.Controls.Add($hint)
+
+    $allRadio = New-Object System.Windows.Forms.RadioButton
+    $allRadio.Location = New-Object System.Drawing.Point(16, 54)
+    $allRadio.Size = New-Object System.Drawing.Size(368, 24)
+    $allRadio.Text = $text.range_all
+    $dialog.Controls.Add($allRadio)
+
+    $someRadio = New-Object System.Windows.Forms.RadioButton
+    $someRadio.Location = New-Object System.Drawing.Point(16, 82)
+    $someRadio.Size = New-Object System.Drawing.Size(96, 24)
+    $someRadio.Text = $text.range_from
+    $dialog.Controls.Add($someRadio)
+
+    $fromBox = New-Object System.Windows.Forms.NumericUpDown
+    $fromBox.Location = New-Object System.Drawing.Point(116, 82)
+    $fromBox.Size = New-Object System.Drawing.Size(78, 26)
+    $fromBox.Minimum = 1
+    $fromBox.Maximum = 99999
+    $dialog.Controls.Add($fromBox)
+
+    $toLabel = New-Object System.Windows.Forms.Label
+    $toLabel.Location = New-Object System.Drawing.Point(202, 86)
+    $toLabel.Size = New-Object System.Drawing.Size(30, 22)
+    $toLabel.Text = $text.range_to
+    $dialog.Controls.Add($toLabel)
+
+    $toBox = New-Object System.Windows.Forms.NumericUpDown
+    $toBox.Location = New-Object System.Drawing.Point(236, 82)
+    $toBox.Size = New-Object System.Drawing.Size(78, 26)
+    $toBox.Minimum = 1
+    $toBox.Maximum = 99999
+    $dialog.Controls.Add($toBox)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Location = New-Object System.Drawing.Point(198, 130)
+    $okButton.Size = New-Object System.Drawing.Size(88, 30)
+    $okButton.Text = $text.range_ok
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dialog.Controls.Add($okButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Location = New-Object System.Drawing.Point(296, 130)
+    $cancelButton.Size = New-Object System.Drawing.Size(88, 30)
+    $cancelButton.Text = $text.cancel
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+
+    $dialog.AcceptButton = $okButton
+    $dialog.CancelButton = $cancelButton
+    $rtl = $script:InterfaceLanguage -eq 'ar'
+    $dialog.RightToLeft = if ($rtl) { 'Yes' } else { 'No' }
+    $dialog.RightToLeftLayout = $rtl
+
+    # Prefill from whatever the file already has.
+    if ($Current -and ($Current.first -or $Current.last)) {
+        $someRadio.Checked = $true
+        if ($Current.first) { $fromBox.Value = $Current.first }
+        if ($Current.last)  { $toBox.Value = $Current.last } else { $toBox.Value = 99999 }
+    } else {
+        $allRadio.Checked = $true
+        $fromBox.Value = 1
+        $toBox.Value = 99999
+    }
+
+    $answer = $dialog.ShowDialog()
+    $result = $null
+    if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {
+        if ($allRadio.Checked) {
+            $result = @{ first = 0; last = 0 }
+        } else {
+            $from = [int]$fromBox.Value
+            $to = [int]$toBox.Value
+            # Accept a backwards range by swapping rather than scolding.
+            if ($to -lt $from) { $swap = $from; $from = $to; $to = $swap }
+            $result = @{ first = $from; last = $to }
+        }
+    }
+    $dialog.Dispose()
+    return $result
+}
+
+function Set-SelectedRange {
+    if ($script:Running -or $FileList.SelectedIndices.Count -eq 0) { return }
+    $firstIndex = [int]$FileList.SelectedIndices[0]
+    $chosen = Show-PageRangeDialog $script:PageRanges[$firstIndex]
+    if ($null -eq $chosen) { return }
+    foreach ($index in @($FileList.SelectedIndices)) {
+        $script:PageRanges[[int]$index] = $chosen
+        $FileList.Items[[int]$index].SubItems[2].Text = Get-RangeText $chosen
+    }
+    $script:Results.Clear()
+    $Progress.Value = 0
+    Refresh-Controls
+}
+
 function Refresh-Controls {
     $hasFiles = $script:InputPaths.Count -gt 0
     $hasOutput = -not [string]::IsNullOrWhiteSpace($OutputText.Text) -and [IO.Directory]::Exists($OutputText.Text)
@@ -308,11 +455,11 @@ function Refresh-Controls {
     $AddButton.Enabled = -not $script:Running
     $RemoveButton.Enabled = -not $script:Running -and $FileList.SelectedItems.Count -gt 0
     $ClearButton.Enabled = -not $script:Running -and $hasFiles
+    $RangeButton.Enabled = -not $script:Running -and $FileList.SelectedItems.Count -gt 0
     $BrowseButton.Enabled = -not $script:Running
     $LanguageChoice.Enabled = -not $script:Running
     $RotateCheck.Enabled = -not $script:Running
     $RedoCheck.Enabled = -not $script:Running
-    $VerboseCheck.Enabled = -not $script:Running
     $OpenOutputButton.Enabled = -not $script:Running -and $script:Results.Count -gt 0
 }
 
@@ -325,8 +472,11 @@ function Add-PdfPaths([string[]]$Paths) {
         if ([IO.Path]::GetExtension($fullPath) -ine '.pdf') { continue }
         if ($script:InputPaths -contains $fullPath) { continue }
         [void]$script:InputPaths.Add($fullPath)
+        $range = @{ first = 0; last = 0 }
+        [void]$script:PageRanges.Add($range)
         $item = New-Object System.Windows.Forms.ListViewItem([IO.Path]::GetFileName($fullPath))
         [void]$item.SubItems.Add([IO.Path]::GetDirectoryName($fullPath))
+        [void]$item.SubItems.Add((Get-RangeText $range))
         [void]$item.SubItems.Add((Get-TextSet).queued)
         $item.Tag = $fullPath
         [void]$FileList.Items.Add($item)
@@ -344,6 +494,7 @@ function Remove-Selected {
     $indices = @($FileList.SelectedIndices | Sort-Object -Descending)
     foreach ($index in $indices) {
         $script:InputPaths.RemoveAt([int]$index)
+        $script:PageRanges.RemoveAt([int]$index)
         $FileList.Items.RemoveAt([int]$index)
     }
     $script:Results.Clear()
@@ -400,7 +551,7 @@ function Handle-WorkerLine([string]$Line) {
                     'cancelled' { $text.cancelled }
                     default { $text.queued }
                 }
-                $FileList.Items[$index].SubItems[2].Text = $stateText
+                $FileList.Items[$index].SubItems[3].Text = $stateText
             }
         }
         'stage' { $StageLabel.Text = [string]$message.text }
@@ -446,8 +597,8 @@ function Finish-Run {
     if ($script:Cancelled) {
         $text = Get-TextSet
         foreach ($item in $FileList.Items) {
-            if ($item.SubItems[2].Text -ne $text.done -and $item.SubItems[2].Text -ne $text.failed) {
-                $item.SubItems[2].Text = $text.cancelled
+            if ($item.SubItems[3].Text -ne $text.done -and $item.SubItems[3].Text -ne $text.failed) {
+                $item.SubItems[3].Text = $text.cancelled
             }
         }
         Append-Log $text.cancelled 'plain'
@@ -494,7 +645,7 @@ function Start-Run {
     $script:Results.Clear()
     $Progress.Value = 0
     $LogBox.Clear()
-    foreach ($item in $FileList.Items) { $item.SubItems[2].Text = $text.queued }
+    foreach ($item in $FileList.Items) { $item.SubItems[3].Text = $text.queued }
 
     $script:JobDir = Join-Path ([IO.Path]::GetTempPath()) ('document_ocr_' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($script:JobDir) | Out-Null
@@ -503,6 +654,11 @@ function Start-Run {
     $language = @('eng', 'eng+ara', 'ara')[$LanguageChoice.SelectedIndex]
     $config = [ordered]@{
         inputs = @($script:InputPaths)
+        # Parallel to inputs; {first=0;last=0} means the whole document. The
+        # worker clamps anything that runs past the real page count.
+        ranges = @($script:PageRanges | ForEach-Object {
+            [ordered]@{ first = [int]$_.first; last = [int]$_.last }
+        })
         output_dir = $OutputText.Text
         job_dir = $script:JobDir
         report_path = $RunReport
@@ -510,7 +666,6 @@ function Start-Run {
             lang = $language
             rotate = [bool]$RotateCheck.Checked
             redo = [bool]$RedoCheck.Checked
-            verbose = [bool]$VerboseCheck.Checked
         }
     }
     $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -567,10 +722,13 @@ $AddButton.Add_Click({
     $dialog.Dispose()
 })
 $RemoveButton.Add_Click({ Remove-Selected })
+$RangeButton.Add_Click({ Set-SelectedRange })
+$FileList.Add_DoubleClick({ Set-SelectedRange })
 $FileList.Add_SelectedIndexChanged({ Refresh-Controls })
 $ClearButton.Add_Click({
     if ($script:Running) { return }
     $script:InputPaths.Clear()
+    $script:PageRanges.Clear()
     $script:Results.Clear()
     $FileList.Items.Clear()
     $LogBox.Clear()
