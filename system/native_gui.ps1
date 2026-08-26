@@ -3,6 +3,44 @@ param([switch]$SelfTest)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# The launcher starts this script with no console attached, so an error that
+# escapes to the top kills the process with nothing on screen at all -- which is
+# exactly what "the window closed and nothing opened" looks like from outside.
+# This turns any such error into a file and a message box.
+#
+# It CANNOT catch a parse error: PowerShell reads and parses the whole file
+# before it runs a single line, so a syntax error dies before this trap exists.
+# "Troubleshoot OCR.bat" checks for that case explicitly.
+trap {
+    $problem = Join-Path $PSScriptRoot 'logs\startup problem.txt'
+    $detail = @(
+        'Document OCR could not start.',
+        '',
+        ('Error:  ' + $_.Exception.Message),
+        ('Type:   ' + $_.Exception.GetType().FullName),
+        ('Where:  ' + $_.InvocationInfo.PositionMessage),
+        '',
+        '--- full detail ---',
+        ($_ | Out-String)
+    ) -join [Environment]::NewLine
+    try {
+        [IO.Directory]::CreateDirectory((Split-Path $problem)) | Out-Null
+        [IO.File]::WriteAllText($problem, $detail)
+    } catch {}
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [void][System.Windows.Forms.MessageBox]::Show(
+            ($detail + [Environment]::NewLine + [Environment]::NewLine + "Saved to: $problem"),
+            'Document OCR',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error)
+    } catch {
+        # No WinForms either. The file above is then the only record.
+        [Console]::Error.WriteLine($detail)
+    }
+    exit 1
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
