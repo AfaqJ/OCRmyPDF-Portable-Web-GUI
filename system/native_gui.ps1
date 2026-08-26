@@ -101,14 +101,22 @@ function Show-StartupFailure($Missing) {
 }
 
 if (-not $SelfTest) {
-    $missing = Get-MissingFiles
+    # @() is not decoration. A function returning an EMPTY @() hands the caller
+    # $null, because PowerShell unrolls the array on the way out -- and
+    # $null.Count throws under StrictMode 2.0. Without the wrap this line killed
+    # the app precisely when nothing was missing, i.e. on every healthy install.
+    # Same rule as D-018: every call site wraps.
+    $missing = @(Get-MissingFiles)
     if ($missing.Count -gt 0) { Show-StartupFailure $missing; exit 1 }
 }
 
 $Strings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'native_strings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 
 if ($SelfTest) {
-    $missing = Get-MissingFiles
+    # Wrapped for the same reason as above. This line is also the regression
+    # test: on a healthy install Get-MissingFiles returns nothing, which is the
+    # exact case that shipped broken, so a passing self-test now proves it.
+    $missing = @(Get-MissingFiles)
     if ($missing.Count -gt 0) {
         throw ('Missing required files: ' + (@($missing | ForEach-Object { $_.path }) -join ', '))
     }
@@ -124,7 +132,7 @@ if ($SelfTest) {
                (@(Compare-Object $enKeys $arKeys | ForEach-Object { $_.InputObject }) -join ', '))
     }
     Write-Output ("native GUI selftest ok - WinForms loaded, " +
-                  "$((Get-RequiredFiles).Count) required files present, " +
+                  "$(@(Get-RequiredFiles).Count) required files present, " +
                   "$($enKeys.Count) interface strings in both languages")
     exit 0
 }
