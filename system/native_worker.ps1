@@ -355,6 +355,25 @@ function Set-PageOrientation([string]$Png, [int]$PageNo, [hashtable]$Decision, $
     }
 }
 
+function Set-BatchOrientation([string[]]$Pngs, [int[]]$PageNumbers, [string]$Name, $Report) {
+    # Check orientation a wave at a time, where a wave is the number of pages
+    # actually running at once, and write each wave's log lines as soon as it
+    # lands. Handing the whole batch over in one call produced nothing in the
+    # log until every page in the batch had been checked, which looks frozen.
+    #
+    # A wave is the floor: four pages really are being checked simultaneously,
+    # so no result for any of them exists until their process exits. Running
+    # with -Jobs 1 gives a line per page, at the cost of the parallel speedup.
+    for ($w = 0; $w -lt $Pngs.Count; $w += $script:MaxParallel) {
+        $end = [Math]::Min($Pngs.Count, $w + $script:MaxParallel) - 1
+        $wave = @($Pngs[$w..$end])
+        $turns = @(Get-OrientationBatch $wave "$Name - checking orientation from page $($PageNumbers[$w]):")
+        for ($k = 0; $k -lt $wave.Count; $k++) {
+            Set-PageOrientation $wave[$k] $PageNumbers[$w + $k] $turns[$k] $Report
+        }
+    }
+}
+
 function Invoke-OneDocument {
     param(
         [int]$Index, [string]$Source, [int]$First, [int]$Last, [int]$PageCount,
@@ -380,11 +399,8 @@ function Invoke-OneDocument {
         $pngs = @(Export-PageImages $Source $slice (Join-Path $pageDir ("c{0:D5}" -f $from)) $Dpi)
 
         if ($Rotate) {
-            $turns = @(Get-OrientationBatch $pngs "$name - checking orientation, pages $from-${to}:")
-            for ($k = 0; $k -lt $slice.Count; $k++) {
-                Set-PageOrientation $pngs[$k] $slice[$k] $turns[$k] $Report
-                Update-Progress
-            }
+            Set-BatchOrientation $pngs $slice $name $Report
+            for ($k = 0; $k -lt $slice.Count; $k++) { Update-Progress }
         }
 
         for ($k = 0; $k -lt $slice.Count; $k++) {
@@ -498,10 +514,7 @@ function Invoke-OneDocumentLossless {
         $pngs = @(Export-PageImages $Source $slice $chunkDir $Dpi)
 
         if ($Rotate) {
-            $turns = @(Get-OrientationBatch $pngs "$name - checking orientation from page $($slice[0]):")
-            for ($k = 0; $k -lt $slice.Count; $k++) {
-                Set-PageOrientation $pngs[$k] $slice[$k] $turns[$k] $Report
-            }
+            Set-BatchOrientation $pngs $slice $name $Report
         }
 
         $calls = New-Object Collections.Generic.List[object]
