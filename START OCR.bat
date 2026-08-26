@@ -60,11 +60,15 @@ set "EXIT_CODE=1"
 exit /b %EXIT_CODE%
 
 :check_file
-if exist "%~2" (
-  echo Found: %~1
-  >>"%REPORT%" echo FILE OK: %~1 = %~2
-  exit /b 0
-)
+rem No parenthesised block here on purpose. cmd.exe substitutes %~2 while it
+rem parses the block, so a ")" anywhere in the path -- "Downloads\folder (1)",
+rem "C:\Program Files (x86)" -- closes the block early and kills the script
+rem with no error. Paths are also quoted when echoed, for the same reason.
+if not exist "%~2" goto :check_file_missing
+echo Found: %~1
+>>"%REPORT%" echo FILE OK: %~1 = "%~2"
+exit /b 0
+:check_file_missing
 echo MISSING: %~1
 >>"%REPORT%" echo FILE FAILED: %~1
 >>"%REPORT%" echo Expected path: %~2
@@ -79,11 +83,11 @@ echo Checking: %~1
 set "CHECK_NAME=%~1"
 shift
 %1 %2 %3 %4 %5 %6 %7 %8 %9 >>"%REPORT%" 2>&1
-if not errorlevel 1 (
-  echo OK: %CHECK_NAME%
-  >>"%REPORT%" echo RESULT: OK - %CHECK_NAME%
-  exit /b 0
-)
+if errorlevel 1 goto :check_command_failed
+echo OK: %CHECK_NAME%
+>>"%REPORT%" echo RESULT: OK - %CHECK_NAME%
+exit /b 0
+:check_command_failed
 echo FAILED: %CHECK_NAME%
 >>"%REPORT%" echo RESULT: FAILED - %CHECK_NAME%
 >>"%REPORT%" echo INTERPRETATION: The error directly above identifies this failed component.
