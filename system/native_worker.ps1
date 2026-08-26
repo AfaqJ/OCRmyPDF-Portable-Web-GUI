@@ -25,14 +25,30 @@
   overhead wrapped around it:
     - Ghostscript renders a batch of pages per process (-ChunkPages, default
       10), not one page per process, so a 350-page PDF is opened ~35 times
-      instead of 350. The batch is deliberately small: page log lines only
-      appear once their batch finishes, so a large batch makes the window look
-      frozen.
-    - Several Tesseract processes run at once (-Jobs); Tesseract itself is one
-      page per process and does not thread.
+      instead of 350.
+    - Up to -Jobs Tesseract processes run at once, and the pool is kept full:
+      the moment one page exits the next one starts. Tesseract is one page per
+      process and does not thread, so this is the only way to use other cores.
   None of this trades accuracy for speed: same engines, same resolution, same
   settings, same output. It only stops re-launching programs and re-reading the
   same PDF. Knobs, if a machine needs different numbers: -Jobs, -ChunkPages.
+
+  Why the progress never jumps
+  ----------------------------
+  A batched engine is fast but silent, and a silent window reads as a frozen
+  one. Every stage therefore reports page by page against the whole document,
+  never per batch, so the numbers only ever count up 1, 2, 3 ... of 22:
+    - Ghostscript writes one file per page as it works, so Invoke-EngineWatched
+      polls the output folder instead of waiting for the process to exit. That
+      covers both the render and the born-digital text scan.
+    - Invoke-EngineBatch reports each parallel process the moment it exits,
+      rather than waiting for a whole wave of four -- that wait was what made
+      the count jump 4, 8, 12.
+    - Assembly reports per page as pages are added.
+  The progress bar uses the same idea: a page is worth one unit per step that
+  will actually be spent on it, so the bar advances at the same rate in every
+  phase. A page that already has text is credited its skipped units at once,
+  because that work genuinely never happens.
 
   Page ranges
   -----------
@@ -86,6 +102,14 @@ $script:PdfLibLoaded = $false
 $script:MaxParallel = if ($Jobs -gt 0) { $Jobs }
                       else { [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount - 1)) }
 $script:ChunkPages = [Math]::Max(1, $ChunkPages)
+
+# How the progress bar is weighted. One unit = one step spent on one page.
+# Both are set for real in Invoke-Run, once the path and the rotate setting are
+# known, because those decide how many steps a page actually costs.
+#   Path B: scan + render + [orientation] + recognise + assemble  = 4 or 5
+#   Path A:        render + [orientation] + build                 = 2 or 3
+$script:UnitsPerOcrPage = 3   # the steps a page skips if it already has text
+$script:UnitsPerPage    = 5   # everything one page costs, start to finish
 # Deliberately absent: any knob that trades output quality for speed. Every
 # change here is structural -- the same engines, the same settings, the same
 # pixels -- so the OCR result is byte-identical to the per-page version.
@@ -107,11 +131,47 @@ function Write-Report($Report, [string]$Text) {
 
 # Progress is one shared counter (script scope, no closures -- closures get
 # their own module scope in PowerShell, which silently breaks the count).
+# A unit is one step spent on one page, so the bar moves at the same rate
+# whether the current step is rendering, checking orientation, recognising or
+# assembling. See "Why the progress never jumps" in the header.
 $script:Done = 0
 $script:TotalUnits = 1
-function Update-Progress {
-    $script:Done++
+function Update-Progress([int]$Units = 1) {
+    if ($Units -le 0) { return }
+    $script:Done += $Units
     Emit 'progress' @{ value = [Math]::Min(99, [int]($script:Done * 100 / $script:TotalUnits)) }
+}
+
+# --- what the window is told about the document being worked on ------------
+# Also script scope, and for the same reason. Every stage line and every file
+# row update counts pages of THIS document, never pages of the current batch,
+# so a batch boundary is invisible to whoever is watching.
+$script:DocIndex = 0
+$script:DocName  = ''
+$script:DocPages = 1
+$script:DocDone  = 0
+
+function Start-Document([int]$Index, [string]$Name, [int]$Pages) {
+    $script:DocIndex = $Index
+    $script:DocName  = $Name
+    $script:DocPages = [Math]::Max(1, $Pages)
+    $script:DocDone  = 0
+    Emit 'file' @{ index = $Index; state = 'running'; pages = $Pages; page = 0 }
+}
+
+function Step-Document([int]$Pages = 1) {
+    # N more pages of this document need no further recognition work: either
+    # Tesseract has just finished them, or they already carried text.
+    if ($Pages -le 0) { return }
+    $script:DocDone = [Math]::Min($script:DocPages, $script:DocDone + $Pages)
+    Emit 'file' @{ index = $script:DocIndex; state = 'running'
+                   pages = $script:DocPages; page = $script:DocDone }
+}
+
+function Show-Stage([string]$Verb, [int]$Done, [int]$Total) {
+    # One shape for every stage: "scan.pdf - reading 7 of 22 pages". Built by
+    # concatenation, not -f: a file name containing a brace would break -f.
+    Emit 'stage' @{ text = "$script:DocName - $Verb $Done of $Total pages" }
 }
 
 # --- small helpers (pure -> unit tested) -----------------------------------
@@ -180,55 +240,112 @@ function ConvertTo-CmdArg([string]$Value) {
     return $Value
 }
 
-function Invoke-EngineBatch([object[]]$Calls, [string]$StagePrefix = '') {
-    # Run several bundled-exe calls at once and return their results in the same
-    # order. Tesseract handles one page per process and does not thread, so the
-    # only way to use the machine's other cores is to run several pages at once.
-    # Each call is @{ exe = <path>; engineArgs = @(...) }.
+function Start-Engine([string]$Exe, [string[]]$EngineArgs) {
+    # Launch one bundled exe and hand back the live process. Nothing waits here,
+    # so the caller decides how to report while it runs.
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = (($EngineArgs | ForEach-Object { ConvertTo-CmdArg $_ }) -join ' ')
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = [Diagnostics.Process]::Start($psi)
+    # Read both pipes async: a full buffer on either one deadlocks the child.
+    return @{
+        proc = $proc
+        out  = $proc.StandardOutput.ReadToEndAsync()
+        err  = $proc.StandardError.ReadToEndAsync()
+        index = 0
+    }
+}
+
+function Complete-Engine($Running) {
+    # WaitForExit() with no timeout is required even after the process has
+    # exited: it is what waits for the two async pipe reads to finish.
+    $Running.proc.WaitForExit()
+    $r = @{ code = $Running.proc.ExitCode; out = $Running.out.Result; err = $Running.err.Result }
+    $Running.proc.Dispose()
+    return $r
+}
+
+function Invoke-Engine([string]$Exe, [string[]]$EngineArgs) {
+    # Run one bundled exe to completion, capture stdout+stderr, no window.
+    return (Complete-Engine (Start-Engine $Exe $EngineArgs))
+}
+
+function Invoke-EngineWatched {
+    # Run ONE engine that writes a file per page, and report each page the
+    # moment its file lands on disk. Ghostscript renders a whole batch in a
+    # single process, so without this the window says nothing at all for the
+    # length of the batch -- the longest silence in the run. Polling the output
+    # folder needs no output stream parsing and cannot deadlock.
+    param(
+        [string]$Exe, [string[]]$EngineArgs,
+        [string]$WatchDir, [string]$Filter, [int]$Expected,
+        [string]$Verb, [int]$Offset, [int]$Total, [int]$ProgressUnits = 1
+    )
+    $run = Start-Engine $Exe $EngineArgs
+    $seen = 0
+    $exited = $false
+    while (-not $exited) {
+        $exited = $run.proc.WaitForExit(200)
+        # On exit everything it was going to write is written; while running,
+        # the newest file may still be half-written, which is fine -- the page
+        # it belongs to really is the one being worked on.
+        $n = if ($exited) { $Expected }
+             else { @(Get-ChildItem -LiteralPath $WatchDir -Filter $Filter -ErrorAction SilentlyContinue).Count }
+        if ($n -gt $Expected) { $n = $Expected }
+        while ($seen -lt $n) {
+            $seen++
+            Show-Stage $Verb ($Offset + $seen) $Total
+            Update-Progress $ProgressUnits
+        }
+    }
+    return (Complete-Engine $run)
+}
+
+function Invoke-EngineBatch {
+    # Run several bundled-exe calls with up to -Jobs alive at once, and return
+    # their results in the order they were given. Each call is
+    # @{ exe = <path>; engineArgs = @(...) }.
+    #
+    # The pool is kept full: the moment one page exits, the next one starts.
+    # The old version launched four, waited for all four, then launched four
+    # more -- which left cores idle at the tail of every wave AND made the
+    # count jump 4, 8, 12 instead of counting up one page at a time.
+    param(
+        [object[]]$Calls, [string]$Verb = '', [int]$Offset = 0, [int]$Total = 0,
+        [int]$ProgressUnits = 0, [bool]$StepDocument = $false
+    )
     if ($Calls.Count -eq 0) { return @() }
     $results = New-Object 'object[]' $Calls.Count
-    $i = 0
+    $running = New-Object Collections.Generic.List[object]
+    $next = 0
     $finished = 0
-    while ($i -lt $Calls.Count) {
-        $running = New-Object Collections.Generic.List[object]
-        while ($running.Count -lt $script:MaxParallel -and $i -lt $Calls.Count) {
-            $c = $Calls[$i]
-            $psi = New-Object Diagnostics.ProcessStartInfo
-            $psi.FileName = $c.exe
-            $psi.Arguments = (($c.engineArgs | ForEach-Object { ConvertTo-CmdArg $_ }) -join ' ')
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $proc = [Diagnostics.Process]::Start($psi)
-            # Read both pipes async: a full buffer on either one deadlocks the child.
-            $running.Add(@{
-                index = $i; proc = $proc
-                out = $proc.StandardOutput.ReadToEndAsync()
-                err = $proc.StandardError.ReadToEndAsync()
-            })
-            $i++
+    while ($finished -lt $Calls.Count) {
+        while ($running.Count -lt $script:MaxParallel -and $next -lt $Calls.Count) {
+            $started = Start-Engine $Calls[$next].exe $Calls[$next].engineArgs
+            $started['index'] = $next
+            [void]$running.Add($started)
+            $next++
         }
-        foreach ($b in $running) {
-            $b.proc.WaitForExit()
-            $results[$b.index] = @{ code = $b.proc.ExitCode; out = $b.out.Result; err = $b.err.Result }
-            $b.proc.Dispose()
+        Start-Sleep -Milliseconds 50
+        # Backwards, because finished entries are removed from the list.
+        for ($j = $running.Count - 1; $j -ge 0; $j--) {
+            if (-not $running[$j].proc.HasExited) { continue }
+            $b = $running[$j]
+            $results[$b.index] = Complete-Engine $b
+            $running.RemoveAt($j)
             $finished++
-            # Say something after every single page. Without this the window
-            # sits silent for a whole batch and looks frozen. A prefix, not a
-            # format string -- a file name containing a brace would break -f.
-            if ($StagePrefix) { Emit 'stage' @{ text = "$StagePrefix $finished/$($Calls.Count)" } }
+            if ($Verb) { Show-Stage $Verb ($Offset + $finished) $Total }
+            Update-Progress $ProgressUnits
+            if ($StepDocument) { Step-Document 1 }
         }
     }
     # Flat array of hashtables. Every caller wraps the result in @() so a
     # single-item result cannot arrive as a bare scalar.
     return $results
-}
-
-function Invoke-Engine([string]$Exe, [string[]]$EngineArgs) {
-    # Run one bundled exe, capture stdout+stderr, no visible window.
-    $one = @(Invoke-EngineBatch @(@{ exe = $Exe; engineArgs = $EngineArgs }))
-    return $one[0]
 }
 
 function Get-ChunkEnd([int]$Count, [int]$Start, [int]$Size) {
@@ -240,20 +357,35 @@ function Get-ChunkEnd([int]$Count, [int]$Start, [int]$Size) {
     return [Math]::Min($Count, $Start + $Size) - 1
 }
 
+function ConvertTo-PostScriptPath([string]$Path) {
+    # Counting pages is the one place a file name is not passed as an argument
+    # but pasted into a PostScript program, where "(" and ")" delimit a string
+    # and "\" escapes. "invoice (1).pdf" survives only because its brackets
+    # happen to balance; "scan (1.pdf" or "report).pdf" would end the string
+    # early and Ghostscript would fail to parse the program at all -- the same
+    # class of bug as the launcher dying on a folder called "... (1)".
+    # Backslashes go first: they become "/", so the escapes added after are the
+    # only backslashes left in the string.
+    return $Path.Replace('\', '/').Replace('(', '\(').Replace(')', '\)')
+}
+
 function Get-PageCount([string]$Pdf) {
     # Ghostscript page-count trick; falls back to 1 on any trouble.
-    $prog = "($($Pdf.Replace('\','/'))) (r) file runpdfbegin pdfpagecount = quit"
+    $prog = "($(ConvertTo-PostScriptPath $Pdf)) (r) file runpdfbegin pdfpagecount = quit"
     $r = Invoke-Engine $script:Ghostscript @('-q', '-dNODISPLAY', '-dNOSAFER', '-c', $prog)
     $m = [regex]::Match($r.out, '\d+')
     if ($m.Success) { return [Math]::Max(1, [int]$m.Value) }
     return 1
 }
 
-function Export-PageImages([string]$Pdf, [int[]]$PageNumbers, [string]$Folder, [int]$Dpi) {
+function Export-PageImages([string]$Pdf, [int[]]$PageNumbers, [string]$Folder, [int]$Dpi,
+                           [int]$Offset = 0, [int]$Total = 0) {
     # Render a batch of pages in ONE Ghostscript process. One process per page
     # meant re-opening and re-parsing the PDF once for every page, which on a
     # 350-page file is 350 full document loads.
     # Returns the rendered files in the same order as $PageNumbers.
+    # $Offset/$Total are only for the "reading N of M pages" line: the process
+    # is watched while it runs so the count rises page by page, not per batch.
     if ($PageNumbers.Count -eq 0) { return @() }
     if (Test-Path -LiteralPath $Folder) { Remove-Item -LiteralPath $Folder -Recurse -Force }
     [IO.Directory]::CreateDirectory($Folder) | Out-Null
@@ -269,7 +401,8 @@ function Export-PageImages([string]$Pdf, [int[]]$PageNumbers, [string]$Folder, [
         $gsArgs += @('-sPageList=' + ($PageNumbers -join ','))
     }
     $gsArgs += @('-o', (Join-Path $Folder 'p%05d.png'), $Pdf)
-    $r = Invoke-Engine $script:Ghostscript $gsArgs
+    $r = Invoke-EngineWatched $script:Ghostscript $gsArgs $Folder 'p*.png' `
+            $PageNumbers.Count 'reading' $Offset ($(if ($Total) { $Total } else { $PageNumbers.Count })) 1
 
     # Ghostscript's %d counter differs between page-range forms, so trust the
     # sorted order rather than the numbers it chose.
@@ -292,15 +425,16 @@ function ConvertTo-OrientationDecision([hashtable]$Osd) {
     return @{ turn = 0; why = 'too little text to tell which way up it is - left alone' }
 }
 
-function Get-OrientationBatch([string[]]$Pngs, [string]$StagePrefix = '') {
+function Get-OrientationBatch([string[]]$Pngs, [int]$Offset = 0, [int]$Total = 0) {
     # The same `--psm 0` check as before, on the same full-resolution image --
     # several tesseract processes at a time instead of one after another.
     if ($Pngs.Count -eq 0) { return @() }
     $calls = New-Object Collections.Generic.List[object]
     foreach ($png in $Pngs) {
-        $calls.Add(@{ exe = $script:Tesseract; engineArgs = @($png, 'stdout', '--psm', '0', '-l', 'osd') })
+        [void]$calls.Add(@{ exe = $script:Tesseract; engineArgs = @($png, 'stdout', '--psm', '0', '-l', 'osd') })
     }
-    $res = @(Invoke-EngineBatch $calls.ToArray() $StagePrefix)
+    $res = @(Invoke-EngineBatch $calls.ToArray() 'checking orientation of' $Offset `
+                ($(if ($Total) { $Total } else { $Pngs.Count })) 1 $false)
     $out = New-Object 'object[]' $Pngs.Count
     for ($i = 0; $i -lt $Pngs.Count; $i++) {
         $out[$i] = ConvertTo-OrientationDecision (ConvertFrom-OsdOutput ($res[$i].out + $res[$i].err))
@@ -355,19 +489,20 @@ function Set-PageOrientation([string]$Png, [int]$PageNo, [hashtable]$Decision, $
     }
 }
 
-function Set-BatchOrientation([string[]]$Pngs, [int[]]$PageNumbers, [string]$Name, $Report) {
+function Set-BatchOrientation([string[]]$Pngs, [int[]]$PageNumbers, [int]$Offset, [int]$Total, $Report) {
     # Check orientation a wave at a time, where a wave is the number of pages
-    # actually running at once, and write each wave's log lines as soon as it
-    # lands. Handing the whole batch over in one call produced nothing in the
-    # log until every page in the batch had been checked, which looks frozen.
+    # actually running at once, and write each wave's LOG lines as soon as it
+    # lands. Handing the whole chunk over in one call produced no log lines
+    # until every page in the chunk had been checked, which looks frozen.
     #
-    # A wave is the floor: four pages really are being checked simultaneously,
-    # so no result for any of them exists until their process exits. Running
-    # with -Jobs 1 gives a line per page, at the cost of the parallel speedup.
+    # The stage line and the progress bar do not wait for the wave: they are
+    # updated by Invoke-EngineBatch as each individual process exits. The wave
+    # is only the granularity of the "Page 7: turned 90 degrees" log lines,
+    # because a rotation cannot be reported before its own process has answered.
     for ($w = 0; $w -lt $Pngs.Count; $w += $script:MaxParallel) {
         $end = [Math]::Min($Pngs.Count, $w + $script:MaxParallel) - 1
         $wave = @($Pngs[$w..$end])
-        $turns = @(Get-OrientationBatch $wave "$Name - checking orientation from page $($PageNumbers[$w]):")
+        $turns = @(Get-OrientationBatch $wave ($Offset + $w) $Total)
         for ($k = 0; $k -lt $wave.Count; $k++) {
             Set-PageOrientation $wave[$k] $PageNumbers[$w + $k] $turns[$k] $Report
         }
@@ -382,7 +517,7 @@ function Invoke-OneDocument {
     )
     $count = $Last - $First + 1
     $name = [IO.Path]::GetFileName($Source)
-    Emit 'file' @{ index = $Index; state = 'running'; pages = $count; page = 0 }
+    Start-Document $Index $name $count
     Emit 'log'  @{ kind = 'head'; text = "$name - $count page(s)" }
     Write-Report $Report "`n===== $Source (pages $First-$Last of $PageCount) ====="
 
@@ -393,25 +528,25 @@ function Invoke-OneDocument {
     $pageNumbers = [int[]]@($First..$Last)
     for ($i = 0; $i -lt $pageNumbers.Count; $i += $script:ChunkPages) {
         $slice = [int[]]@($pageNumbers[$i..(Get-ChunkEnd $pageNumbers.Count $i $script:ChunkPages)])
-        $from = $slice[0]
-        $to   = $slice[$slice.Count - 1]
-        Emit 'stage' @{ text = "$name - reading pages $from-$to of $Last" }
-        $pngs = @(Export-PageImages $Source $slice (Join-Path $pageDir ("c{0:D5}" -f $from)) $Dpi)
+        $pngs = @(Export-PageImages $Source $slice (Join-Path $pageDir ("c{0:D5}" -f $slice[0])) $Dpi $i $count)
 
-        if ($Rotate) {
-            Set-BatchOrientation $pngs $slice $name $Report
-            for ($k = 0; $k -lt $slice.Count; $k++) { Update-Progress }
-        }
+        if ($Rotate) { Set-BatchOrientation $pngs $slice $i $count $Report }
 
         for ($k = 0; $k -lt $slice.Count; $k++) {
-            $images.Add($pngs[$k])
-            Emit 'file' @{ index = $Index; state = 'running'; pages = $count; page = ($slice[$k] - $First + 1) }
-            Update-Progress
+            [void]$images.Add($pngs[$k])
+            Step-Document 1
         }
     }
 
-    Emit 'stage' @{ text = "$name - building searchable PDF" }
+    # ponytail: the one step in either path that cannot report per page.
+    # Tesseract is handed the whole page list and writes one PDF at the end, so
+    # nothing lands on disk to count until it is finished. Path B does not have
+    # this problem because it writes one PDF per page. Fixing it here needs a
+    # way to merge PDFs without PDFsharp -- which is the very thing Path A
+    # exists to do without. Its units are credited in one go below.
+    Emit 'stage' @{ text = "$name - building the searchable PDF from $count page(s) - last step" }
     $ocr = Invoke-TesseractPdf $images.ToArray() (Join-Path $pageDir 'out') $Lang $Dpi
+    Update-Progress $count
 
     $target = Get-NextTarget $OutputDir $Source (Get-RangeSuffix $First $Last $PageCount)
     Publish-Output $ocr $target
@@ -450,11 +585,14 @@ function Get-PagesWithText([string]$Pdf, [int]$First, [int]$Last, [string]$WorkD
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
     [IO.Directory]::CreateDirectory($dir) | Out-Null
     try {
-        $r = Invoke-Engine $script:Ghostscript @(
+        # Watched, not just run: txtwrite drops one .txt per page as it goes, so
+        # the folder is a live page counter for a pass that would otherwise be
+        # one long silence at the very start of every document.
+        $r = Invoke-EngineWatched $script:Ghostscript @(
             '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER', '-sDEVICE=txtwrite',
             "-dFirstPage=$First", "-dLastPage=$Last",
             '-o', (Join-Path $dir 't%05d.txt'), $Pdf
-        )
+        ) $dir 't*.txt' $count 'checking for existing text on' 0 $count 1
         $files = @(Get-ChildItem -LiteralPath $dir -Filter 't*.txt' -ErrorAction SilentlyContinue |
                    Sort-Object Name)
         if ($r.code -eq 0 -and $files.Count -eq $count) {
@@ -484,8 +622,7 @@ function Invoke-OneDocumentLossless {
     )
     $count = $Last - $First + 1
     $name = [IO.Path]::GetFileName($Source)
-    $perPage = if ($Rotate) { 2 } else { 1 }
-    Emit 'file' @{ index = $Index; state = 'running'; pages = $count; page = 0 }
+    Start-Document $Index $name $count
     Emit 'log'  @{ kind = 'head'; text = "$name - $count page(s)" }
     Write-Report $Report "`n===== $Source (lossless path, pages $First-$Last of $PageCount) ====="
 
@@ -493,11 +630,33 @@ function Invoke-OneDocumentLossless {
     [IO.Directory]::CreateDirectory($pageDir) | Out-Null
 
     # --- phase 1: which pages already have a text layer? --------------------
-    Emit 'stage' @{ text = "$name - checking which pages already have text" }
-    $hasText = @(if ($Redo) { New-Object 'bool[]' $count }
-                 else { Get-PagesWithText $Source $First $Last $pageDir })
+    Show-Stage 'checking for existing text on' 0 $count
+    if ($Redo) {
+        # "Redo" means treat every page as needing OCR, so the scan is skipped
+        # entirely -- and its one unit per page has to be credited here, or the
+        # bar would run a whole phase short for this document.
+        $hasText = @(New-Object 'bool[]' $count)
+        Update-Progress $count
+    } else {
+        $hasText = @(Get-PagesWithText $Source $First $Last $pageDir)
+    }
     $need = New-Object Collections.Generic.List[int]
-    for ($p = $First; $p -le $Last; $p++) { if (-not $hasText[$p - $First]) { $need.Add($p) } }
+    for ($p = $First; $p -le $Last; $p++) { if (-not $hasText[$p - $First]) { [void]$need.Add($p) } }
+
+    # A page that already has text skips the render, the orientation check and
+    # recognition. That work genuinely never happens, so credit it now rather
+    # than letting the bar crawl and then leap at the end.
+    $skipped = $count - $need.Count
+    if ($skipped -gt 0) {
+        Update-Progress ($skipped * ($script:UnitsPerOcrPage))
+        Step-Document $skipped
+    }
+    # Say the split out loud. Without it the stage line counts "of 20 pages"
+    # while the file row counts "of 22" and there is nothing on screen
+    # explaining where the other two went.
+    Emit 'log' @{ kind = 'dim'; text = ("$name - $skipped of $count page(s) already have text and are kept " +
+                                        "unchanged; $($need.Count) page(s) need OCR") }
+    Write-Report $Report "   $skipped of $count page(s) already have text; $($need.Count) need OCR"
 
     # --- phase 2: OCR the scanned pages, straight to disk -------------------
     # ponytail: one PDF per page, so phase 3 opens as many documents as there
@@ -506,34 +665,35 @@ function Invoke-OneDocumentLossless {
     $ocrPdf = @{}
     $batch = 0
     $needPages = [int[]]@($need.ToArray())
+    $needTotal = $needPages.Count
     for ($i = 0; $i -lt $needPages.Count; $i += $script:ChunkPages) {
         $slice = [int[]]@($needPages[$i..(Get-ChunkEnd $needPages.Count $i $script:ChunkPages)])
         $batch++
         $chunkDir = Join-Path $pageDir ("c{0:D5}" -f $batch)
-        Emit 'stage' @{ text = "$name - reading page $($slice[0]) of $Last" }
-        $pngs = @(Export-PageImages $Source $slice $chunkDir $Dpi)
+        # Every count below is "of the pages this document still needs", not
+        # "of this chunk", so the numbers keep rising across chunk boundaries.
+        $pngs = @(Export-PageImages $Source $slice $chunkDir $Dpi $i $needTotal)
 
-        if ($Rotate) {
-            Set-BatchOrientation $pngs $slice $name $Report
-        }
+        if ($Rotate) { Set-BatchOrientation $pngs $slice $i $needTotal $Report }
 
         $calls = New-Object Collections.Generic.List[object]
         for ($k = 0; $k -lt $slice.Count; $k++) {
-            $calls.Add(@{
+            [void]$calls.Add(@{
                 exe = $script:Tesseract
                 engineArgs = @($pngs[$k], (Join-Path $chunkDir ("p{0:D5}" -f $slice[$k])),
                                '--dpi', "$Dpi", '-l', $Lang, 'pdf')
             })
         }
-        $res = @(Invoke-EngineBatch $calls.ToArray() "$name - reading from page $($slice[0]):")
+        # The file row and the bar move as each page's own process exits, from
+        # inside the runner -- not in this loop, which cannot run until every
+        # process in the chunk has finished.
+        $res = @(Invoke-EngineBatch $calls.ToArray() 'recognising text on' $i $needTotal 1 $true)
         for ($k = 0; $k -lt $slice.Count; $k++) {
             $onePdf = (Join-Path $chunkDir ("p{0:D5}.pdf" -f $slice[$k]))
             if ($res[$k].code -ne 0 -or -not (Test-Path -LiteralPath $onePdf)) {
                 throw "Tesseract could not build page $($slice[$k]) ($($res[$k].err.Trim()))"
             }
             $ocrPdf[$slice[$k]] = $onePdf
-            Emit 'file' @{ index = $Index; state = 'running'; pages = $count; page = ($slice[$k] - $First + 1) }
-            for ($u = 0; $u -lt $perPage; $u++) { Update-Progress }
         }
         # The page images have done their job; only the one-page PDFs are needed
         # at assembly. Drop them so temp does not hold the document twice over.
@@ -542,7 +702,7 @@ function Invoke-OneDocumentLossless {
     }
 
     # --- phase 3: assemble, now that every page is already on disk ----------
-    Emit 'stage' @{ text = "$name - assembling searchable PDF" }
+    Show-Stage 'assembling' 0 $count
     $staged = Join-Path $pageDir 'assembled.pdf'
     $reader = [PdfSharp.Pdf.IO.PdfReader]::Open($Source, [PdfSharp.Pdf.IO.PdfDocumentOpenMode]::Import)
     $output = New-Object PdfSharp.Pdf.PdfDocument
@@ -551,14 +711,17 @@ function Invoke-OneDocumentLossless {
         for ($p = $First; $p -le $Last; $p++) {
             if ($ocrPdf.ContainsKey($p)) {
                 $ocrDoc = [PdfSharp.Pdf.IO.PdfReader]::Open($ocrPdf[$p], [PdfSharp.Pdf.IO.PdfDocumentOpenMode]::Import)
-                $ocrDocs.Add($ocrDoc)
+                [void]$ocrDocs.Add($ocrDoc)
                 [void]$output.AddPage($ocrDoc.Pages[0])
             } else {
                 [void]$output.AddPage($reader.Pages[$p - 1])   # untouched, lossless
                 Emit 'log' @{ kind = 'dim'; text = "Page ${p}: already has text - kept unchanged" }
                 Write-Report $Report "   page ${p}: already has text - kept unchanged"
-                for ($u = 0; $u -lt $perPage; $u++) { Update-Progress }
             }
+            # Assembly is fast, but on a 350-page file it is still long enough
+            # to look like a hang if it says nothing, so it counts too.
+            Show-Stage 'assembling' ($p - $First + 1) $count
+            Update-Progress 1
         }
         $output.Save($staged)
     } finally {
@@ -609,6 +772,9 @@ function Invoke-Run([hashtable]$Job) {
             Emit 'log'  @{ kind = 'bad'; text = "Skipped missing or non-PDF file: $src" }
             continue
         }
+        # Ghostscript has to open the file to answer this, which is a second or
+        # two on a large PDF. Say which file, so the window is never blank.
+        Emit 'stage' @{ text = "Opening $([IO.Path]::GetFileName($src))" }
         $pages = Get-PageCount $src
         $wantFirst = 0; $wantLast = 0
         if ($i -lt $ranges.Count -and $ranges[$i]) {
@@ -627,27 +793,33 @@ function Invoke-Run([hashtable]$Job) {
         Emit 'file' @{ index = $i; state = 'queued'; pages = $range.count }
     }
 
-    $perPage = if ($rotate) { 2 } else { 1 }
-    $sum = ($valid | ForEach-Object { $_.count * $perPage } | Measure-Object -Sum).Sum
-    $script:TotalUnits = [Math]::Max(1, [int]$sum)
-    $script:Done = 0
-
-    $report = $null
-    if ($Job.ContainsKey('report_path') -and $Job.report_path) {
-        $report = New-Object IO.StreamWriter($Job.report_path, $false, (New-Object Text.UTF8Encoding($false)))
-        Write-Report $report "Document OCR native worker report (Path A: tesseract + ghostscript)"
-        Write-Report $report "Output: $outputDir"
-        Write-Report $report ("Options: lang=$lang rotate=$rotate dpi=$dpi")
-        Write-Report $report ("Speed: jobs=$($script:MaxParallel) chunk=$($script:ChunkPages)")
-    }
-
-    # Decide the path. Path B (lossless) needs the PDF library to load.
+    # Decide the path first, because it decides what a page costs. Path B
+    # (lossless) needs the PDF library to load.
     $useB = $false
     if ($mode -ne 'A') {
         if (Test-PdfLibrary) { $useB = $true }
         elseif ($mode -eq 'B') {
             Emit 'log' @{ kind = 'bad'; text = 'PDF library did not load; using the rasterize path.' }
         }
+    }
+
+    # Weight the bar by the steps a page will really cost on the chosen path,
+    # so it advances at one rate from start to finish instead of standing still
+    # through a render and then leaping. See Update-Progress.
+    $script:UnitsPerOcrPage = 2 + $(if ($rotate) { 1 } else { 0 })   # render + [orientation] + recognise
+    $script:UnitsPerPage = if ($useB) { $script:UnitsPerOcrPage + 2 }  # + text scan + assemble
+                           else       { $script:UnitsPerOcrPage }     # Path A: the build replaces recognise
+    $sum = ($valid | ForEach-Object { $_.count * $script:UnitsPerPage } | Measure-Object -Sum).Sum
+    $script:TotalUnits = [Math]::Max(1, [int]$sum)
+    $script:Done = 0
+
+    $report = $null
+    if ($Job.ContainsKey('report_path') -and $Job.report_path) {
+        $report = New-Object IO.StreamWriter($Job.report_path, $false, (New-Object Text.UTF8Encoding($false)))
+        Write-Report $report "Document OCR native worker report (tesseract + ghostscript)"
+        Write-Report $report "Output: $outputDir"
+        Write-Report $report ("Options: lang=$lang rotate=$rotate dpi=$dpi")
+        Write-Report $report ("Speed: jobs=$($script:MaxParallel) chunk=$($script:ChunkPages)")
     }
     Write-Report $report ("Path: {0}" -f $(if ($useB) { 'B (lossless)' } else { 'A (rasterize)' }))
 
@@ -719,6 +891,15 @@ function Convert-JsonToHashtable($Obj) {
 }
 
 function Invoke-SelfTest {
+    # Several checks below drive the real progress and stage helpers, which emit
+    # JSON. With no events file that JSON goes to the console and buries the
+    # ok/FAIL list, so send it nowhere for the duration.
+    $script:EventWriter = New-Object IO.StreamWriter([IO.Stream]::Null)
+    try { return (Invoke-SelfTestBody) }
+    finally { $script:EventWriter.Dispose(); $script:EventWriter = $null }
+}
+
+function Invoke-SelfTestBody {
     $fail = 0
     function Check([string]$Name, [bool]$Ok) {
         if ($Ok) { Write-Host "  ok  - $Name" }
@@ -737,6 +918,19 @@ function Invoke-SelfTest {
 
     Check 'quote plain' ((ConvertTo-CmdArg 'abc') -eq 'abc')
     Check 'quote spaces' ((ConvertTo-CmdArg 'a b') -eq '"a b"')
+
+    # Brackets in a file name. Everywhere else a path is an argument, where
+    # brackets mean nothing; in the page-count program it is a PostScript
+    # string, where they are syntax. This is the same bug class that killed the
+    # launcher when its own folder was called "... (1)".
+    Check 'postscript path uses forward slashes' (
+        (ConvertTo-PostScriptPath 'C:\x\a.pdf') -eq 'C:/x/a.pdf')
+    Check 'postscript path escapes balanced brackets' (
+        (ConvertTo-PostScriptPath 'C:\Downloads (1)\a.pdf') -eq 'C:/Downloads \(1\)/a.pdf')
+    Check 'postscript path escapes an unbalanced bracket' (
+        (ConvertTo-PostScriptPath 'C:\x\scan (1.pdf') -eq 'C:/x/scan \(1.pdf')
+    Check 'postscript path leaves no bare bracket behind' (
+        (ConvertTo-PostScriptPath 'C:\Program Files (x86)\report).pdf') -notmatch '(?<!\\)[()]')
 
     $turn = ConvertTo-OrientationDecision @{ turn = 270; conf = 5.0 }
     Check 'decision turns' ($turn.turn -eq 270)
@@ -798,8 +992,25 @@ function Invoke-SelfTest {
     Check 'tesseract present' (Test-Path -LiteralPath $script:Tesseract)
     Check 'ghostscript present' (Test-Path -LiteralPath $script:Ghostscript)
 
-    # The parallel process runner is the riskiest new part: prove it really runs
-    # every call and returns the results in order.
+    # The progress counter must land on exactly 100% of its own total, or the
+    # bar creeps or stalls. Replay a 25-page document the way Path B spends it:
+    # 5 pages already carry text, 20 need OCR, orientation on.
+    $savedTotal = $script:TotalUnits; $savedDone = $script:Done
+    $savedOcr = $script:UnitsPerOcrPage; $savedPer = $script:UnitsPerPage
+    $script:UnitsPerOcrPage = 3            # render + orientation + recognise
+    $script:UnitsPerPage    = 5            # + text scan + assemble
+    $script:TotalUnits = 25 * $script:UnitsPerPage
+    $script:Done = 0
+    Update-Progress 25                                     # phase 1: scan every page
+    Update-Progress (5 * $script:UnitsPerOcrPage)          # 5 pages skip the OCR work
+    for ($p = 0; $p -lt 20; $p++) { Update-Progress 3 }    # 20 pages rendered/turned/read
+    Update-Progress 25                                     # phase 3: assemble every page
+    Check 'progress lands exactly on its total' ($script:Done -eq $script:TotalUnits)
+    $script:TotalUnits = $savedTotal; $script:Done = $savedDone
+    $script:UnitsPerOcrPage = $savedOcr; $script:UnitsPerPage = $savedPer
+
+    # The parallel process runner is the riskiest part: prove it really runs
+    # every call, returns the results in order, and keeps the pool full.
     if (Test-Path -LiteralPath $script:Ghostscript) {
         # -h prints the banner and exits; -v can sit waiting on stdin.
         $probe = @(Invoke-EngineBatch @(
@@ -809,6 +1020,33 @@ function Invoke-SelfTest {
         ))
         Check 'parallel runner returns every result' ($probe.Count -eq 3)
         Check 'parallel runner captures output' (($probe | Where-Object { $_.out -match 'Ghostscript' }).Count -eq 3)
+        # More calls than slots: the pool has to refill, which is where a
+        # scheduler bug would hang or drop a result.
+        $many = New-Object Collections.Generic.List[object]
+        for ($p = 0; $p -lt ($script:MaxParallel * 2 + 1); $p++) {
+            [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h') })
+        }
+        $refill = @(Invoke-EngineBatch $many.ToArray())
+        Check 'pool refills past the first wave' (
+            $refill.Count -eq $many.Count -and
+            (($refill | Where-Object { $_.code -eq 0 }).Count -eq $many.Count))
+
+        # And the watched runner: one process, one file per page, counted as
+        # they land. Ghostscript renders its own bundled example to prove it.
+        $watchDir = Join-Path ([IO.Path]::GetTempPath()) ('ocrwatch_' + [Guid]::NewGuid().ToString('N'))
+        [IO.Directory]::CreateDirectory($watchDir) | Out-Null
+        try {
+            $ps = Join-Path $watchDir 'three.ps'
+            Set-Content -LiteralPath $ps -Encoding ASCII -Value @(
+                'showpage', 'showpage', 'showpage')
+            $w = Invoke-EngineWatched $script:Ghostscript @(
+                '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER', '-sDEVICE=png16m', '-r36',
+                '-o', (Join-Path $watchDir 'p%05d.png'), $ps) `
+                $watchDir 'p*.png' 3 'reading' 0 3 0
+            $made = @(Get-ChildItem -LiteralPath $watchDir -Filter 'p*.png' -ErrorAction SilentlyContinue)
+            Check 'watched runner produced a file per page' ($w.code -eq 0 -and $made.Count -eq 3)
+        } finally { Remove-Item -LiteralPath $watchDir -Recurse -Force -ErrorAction SilentlyContinue }
+
         Write-Host "  info- $($script:MaxParallel) page(s) at a time, $($script:ChunkPages) page(s) per render"
     }
     # Path B is optional: report whether the PDF library loads, but never fail on it.

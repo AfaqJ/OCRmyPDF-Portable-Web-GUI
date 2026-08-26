@@ -1,99 +1,53 @@
 @echo off
+rem Opens Document OCR. That is the whole job of this file.
+rem
+rem Nothing is printed and nothing is checked here on purpose. The app verifies
+rem its own files milliseconds after it starts (Test-Startup in
+rem system\native_gui.ps1) and shows a message box if one is missing -- so a
+rem broken download is still reported, just not to a console nobody wants to
+rem see. The two -SelfTest runs that used to happen here are developer checks;
+rem they are still there, run by hand, and no longer sit in front of the user.
+rem
+rem cmd.exe always draws a window for a .bat file, so this one does as little
+rem as possible and exits: a brief flash instead of a console.
+rem
+rem Every path below is quoted and no path is expanded inside a parenthesised
+rem block. That is not style -- an unquoted path is what made this script die
+rem silently when its own folder was called "...-dotnet-ocr (1)": cmd.exe
+rem substitutes the text while it parses the block, so the ")" ended the block
+rem early and the rest of the script was abandoned with no error.
 setlocal
-title Document OCR launcher - leave this window open
 call "%~dp0system\env.bat"
-
-set "REPORT=%~dp0OCR startup report.txt"
+set "GUI=%~dp0system\native_gui.ps1"
 set "POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-set "FAILURES=0"
-set "EXIT_CODE=0"
 
->"%REPORT%" echo Document OCR startup report (Python-free: tesseract + ghostscript + .NET)
->>"%REPORT%" echo Generated: %DATE% %TIME%
+if not exist "%GUI%" goto :broken
+if not exist "%POWERSHELL%" goto :nopowershell
 
-echo.
-echo === Document OCR startup check ===
-call :check_file "Windows PowerShell" "%POWERSHELL%"
-call :check_file "OCR window" "%~dp0system\native_gui.ps1"
-call :check_file "OCR worker" "%~dp0system\native_worker.ps1"
-call :check_file "Interface languages" "%~dp0system\native_strings.json"
-call :check_file "Tesseract" "%APP%\Library\bin\tesseract.exe"
-call :check_file "Ghostscript" "%APP%\Library\bin\gswin64c.exe"
-call :check_file "English OCR language" "%APP%\share\tessdata\eng.traineddata"
-call :check_file "Arabic OCR language" "%APP%\share\tessdata\ara.traineddata"
-call :check_file "Orientation data" "%APP%\share\tessdata\osd.traineddata"
+rem -WindowStyle Hidden hides the PowerShell host window, not the OCR window,
+rem which native_gui.ps1 shows itself. start hands the app its own process so
+rem this console can close immediately.
+start "Document OCR" "%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%GUI%"
+exit /b 0
 
+:broken
+rem The one case that still gets a visible window: there is no app to put the
+rem message in.
+echo Document OCR cannot start - a file is missing:
+echo   "%GUI%"
 echo.
-call :check_command "Tesseract OCR engine" "%APP%\Library\bin\tesseract.exe" --version
-call :check_command "Ghostscript PDF engine" "%APP%\Library\bin\gswin64c.exe" --version
-call :check_command "OCR worker self-test" "%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0system\native_worker.ps1" -SelfTest
-call :check_command "Windows Forms interface" "%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0system\native_gui.ps1" -SelfTest
-
-if "%FAILURES%"=="1" goto :failed
-
-echo.
-echo All startup checks passed.
-echo Opening Document OCR...
->>"%REPORT%" echo.
->>"%REPORT%" echo RESULT: All startup checks passed.
-rem Hand the app to its own process and let this console close, so the user is
-rem left with only the OCR window. -WindowStyle Hidden suppresses the PowerShell
-rem host window; it does not hide the Windows Forms window, which native_gui.ps1
-rem shows itself. The console stays open only when a check above failed, which
-rem is exactly when its output is worth reading.
-rem Trade-off: this console no longer captures errors raised by the app after it
-rem starts. The Windows Forms self-test runs seconds earlier and covers loading.
-start "Document OCR" "%POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0system\native_gui.ps1"
-goto :end
-
-:failed
-echo.
-echo Document OCR could not start because one or more checks failed.
-echo The complete evidence is saved in:
-echo %REPORT%
-echo.
-type "%REPORT%"
-echo.
-echo Keep OCR startup report.txt for troubleshooting.
-echo This window will remain open until you press a key.
+echo The ZIP was not extracted completely, or security software removed a file.
+echo Extract the whole folder again, then run this file once more.
 echo.
 pause
-set "EXIT_CODE=1"
-
-:end
-exit /b %EXIT_CODE%
-
-:check_file
-rem No parenthesised block here on purpose. cmd.exe substitutes %~2 while it
-rem parses the block, so a ")" anywhere in the path -- "Downloads\folder (1)",
-rem "C:\Program Files (x86)" -- closes the block early and kills the script
-rem with no error. Paths are also quoted when echoed, for the same reason.
-if not exist "%~2" goto :check_file_missing
-echo Found: %~1
->>"%REPORT%" echo FILE OK: %~1 = "%~2"
-exit /b 0
-:check_file_missing
-echo MISSING: %~1
->>"%REPORT%" echo FILE FAILED: %~1
->>"%REPORT%" echo Expected path: %~2
->>"%REPORT%" echo INTERPRETATION: The ZIP is incomplete, was not fully extracted, or security software removed a required file.
-set "FAILURES=1"
 exit /b 1
 
-:check_command
-echo Checking: %~1
->>"%REPORT%" echo.
->>"%REPORT%" echo ===== %~1 =====
-set "CHECK_NAME=%~1"
-shift
-%1 %2 %3 %4 %5 %6 %7 %8 %9 >>"%REPORT%" 2>&1
-if errorlevel 1 goto :check_command_failed
-echo OK: %CHECK_NAME%
->>"%REPORT%" echo RESULT: OK - %CHECK_NAME%
-exit /b 0
-:check_command_failed
-echo FAILED: %CHECK_NAME%
->>"%REPORT%" echo RESULT: FAILED - %CHECK_NAME%
->>"%REPORT%" echo INTERPRETATION: The error directly above identifies this failed component.
-set "FAILURES=1"
+:nopowershell
+echo Document OCR cannot start - Windows PowerShell was not found:
+echo   "%POWERSHELL%"
+echo.
+echo This is part of Windows. If it is missing or blocked, this tool cannot run
+echo on this PC without help from IT.
+echo.
+pause
 exit /b 1

@@ -11,12 +11,68 @@ $Root = Split-Path -Parent $PSScriptRoot
 $App = Join-Path $Root 'app'
 $PowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $Worker = Join-Path $PSScriptRoot 'native_worker.ps1'
+# Reports live in system\logs\ rather than beside the launcher. They are
+# troubleshooting output, and two stray .txt files in the folder someone was
+# handed is exactly the clutter this app should not create.
+$LogDir = Join-Path $PSScriptRoot 'logs'
+$RunReport = Join-Path $LogDir 'last run.txt'
+$StartupReport = Join-Path $LogDir 'startup problem.txt'
+
+function Get-RequiredFiles {
+    # Everything the app cannot run without. Checked here rather than in the
+    # launcher so the check costs a few milliseconds and shows a message box
+    # instead of a console. Self-tests are NOT run here: they are developer
+    # checks that took seconds and put a wall of text in front of the user.
+    return @(
+        @{ what = 'Windows PowerShell';   path = $PowerShell },
+        @{ what = 'OCR worker';           path = $Worker },
+        @{ what = 'Interface languages';  path = (Join-Path $PSScriptRoot 'native_strings.json') },
+        @{ what = 'Tesseract OCR engine'; path = (Join-Path $App 'Library\bin\tesseract.exe') },
+        @{ what = 'Ghostscript PDF engine'; path = (Join-Path $App 'Library\bin\gswin64c.exe') },
+        @{ what = 'English OCR language'; path = (Join-Path $App 'share\tessdata\eng.traineddata') },
+        @{ what = 'Arabic OCR language';  path = (Join-Path $App 'share\tessdata\ara.traineddata') },
+        @{ what = 'Orientation data';     path = (Join-Path $App 'share\tessdata\osd.traineddata') }
+    )
+}
+
+function Get-MissingFiles {
+    return @(Get-RequiredFiles | Where-Object { -not [IO.File]::Exists($_.path) })
+}
+
+function Show-StartupFailure($Missing) {
+    # No console exists to print to, so say it in a dialog and leave the detail
+    # in a file the user can send on.
+    $lines = New-Object Collections.Generic.List[string]
+    [void]$lines.Add('Document OCR could not start.')
+    [void]$lines.Add('')
+    [void]$lines.Add('These files are missing:')
+    foreach ($m in $Missing) { [void]$lines.Add(("  {0}  ->  {1}" -f $m.what, $m.path)) }
+    [void]$lines.Add('')
+    [void]$lines.Add('The ZIP was not extracted completely, or security software removed a file.')
+    [void]$lines.Add('Extract the whole folder again and try once more.')
+    $text = ($lines -join [Environment]::NewLine)
+    try {
+        [IO.Directory]::CreateDirectory($LogDir) | Out-Null
+        [IO.File]::WriteAllText($StartupReport, $text + [Environment]::NewLine)
+        $text += [Environment]::NewLine + [Environment]::NewLine + "Saved to: $StartupReport"
+    } catch {}
+    [void][System.Windows.Forms.MessageBox]::Show(
+        $text, 'Document OCR',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error)
+}
+
+if (-not $SelfTest) {
+    $missing = Get-MissingFiles
+    if ($missing.Count -gt 0) { Show-StartupFailure $missing; exit 1 }
+}
+
 $Strings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'native_strings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$RunReport = Join-Path $Root 'OCR native run report.txt'
 
 if ($SelfTest) {
-    foreach ($required in @($PowerShell, $Worker, (Join-Path $PSScriptRoot 'native_strings.json'))) {
-        if (-not [IO.File]::Exists($required)) { throw "Missing required file: $required" }
+    $missing = Get-MissingFiles
+    if ($missing.Count -gt 0) {
+        throw ('Missing required files: ' + (@($missing | ForEach-Object { $_.path }) -join ', '))
     }
     if ($null -eq $Strings.en -or $null -eq $Strings.ar) {
         throw 'The interface language file is incomplete.'
@@ -29,7 +85,9 @@ if ($SelfTest) {
         throw ('Interface text differs between languages: ' +
                (@(Compare-Object $enKeys $arKeys | ForEach-Object { $_.InputObject }) -join ', '))
     }
-    Write-Output "native GUI selftest ok - WinForms loaded, $($enKeys.Count) interface strings in both languages"
+    Write-Output ("native GUI selftest ok - WinForms loaded, " +
+                  "$((Get-RequiredFiles).Count) required files present, " +
+                  "$($enKeys.Count) interface strings in both languages")
     exit 0
 }
 
@@ -649,6 +707,8 @@ function Start-Run {
 
     $script:JobDir = Join-Path ([IO.Path]::GetTempPath()) ('document_ocr_' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($script:JobDir) | Out-Null
+    # The worker opens the report for writing, so its folder has to exist first.
+    [IO.Directory]::CreateDirectory($LogDir) | Out-Null
     $configPath = Join-Path $script:JobDir 'job.json'
     $eventPath = Join-Path $script:JobDir 'events.jsonl'
     $language = @('eng', 'eng+ara', 'ara')[$LanguageChoice.SelectedIndex]
