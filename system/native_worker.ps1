@@ -11,17 +11,18 @@
   driven from PowerShell (.NET, always allowed).
 
   This file is "Path A": the engines-only, rasterizing path. It re-renders each
-  page to an image, corrects orientation with Tesseract's own detector (the same
-  algorithm prerotate.py used), and lets Tesseract emit a searchable PDF with an
-  invisible text layer. For scanned documents the result is visually identical
+  page to an image, corrects orientation with Tesseract's own detector
+  (-OsdCrops sample windows of the page vote; the whole-page check prerotate.py
+  used is the fallback, and only runs when they cannot agree -- D-024), and lets
+  Tesseract emit a searchable PDF with an invisible text layer. For scanned documents the result is visually identical
   to OCRmyPDF's output at the same resolution. Path B (a lossless text overlay
   onto the original page, via a .NET PDF library) layers on top of this later
   and falls back to this path if the library is unavailable.
 
   Where the time goes
   -------------------
-  Every page costs one Ghostscript render, one Tesseract orientation check and
-  one Tesseract OCR pass. That work is irreducible. What was reducible was the
+  Every page costs one Ghostscript render, one or more Tesseract orientation
+  checks and one Tesseract OCR pass. That work is irreducible. What was reducible was the
   overhead wrapped around it:
     - Ghostscript renders a batch of pages per process (-ChunkPages, default
       10), not one page per process, so a 350-page PDF is opened ~35 times
@@ -80,7 +81,14 @@ param(
     [ValidateSet('auto', 'A', 'B')][string]$Mode = 'auto',
     # Speed knobs. 0 = pick from the core count. See "speed" note below.
     [int]$Jobs = 0,
-    [int]$ChunkPages = 10
+    [int]$ChunkPages = 10,
+    # How much extracted text makes a page "already has text". See
+    # Test-PageHasText -- a stamp is not a text layer.
+    [int]$TextMinChars = 100,
+    # How many small crops of each page get their own orientation check and
+    # vote. 0 = ask the whole page once, which is what this did before.
+    # See Get-OrientationBatch.
+    [int]$OsdCrops = 5
 )
 
 Set-StrictMode -Version 2.0
@@ -102,6 +110,12 @@ $script:PdfLibLoaded = $false
 $script:MaxParallel = if ($Jobs -gt 0) { $Jobs }
                       else { [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount - 1)) }
 $script:ChunkPages = [Math]::Max(1, $ChunkPages)
+$script:TextMinChars = [Math]::Max(1, $TextMinChars)
+$script:OsdCrops = [Math]::Max(0, [Math]::Min(5, $OsdCrops))
+# 650 px is the crop size used by the makandra recipe this follows. At
+# 300 dpi that is about 2.2 inches -- enough body text for OSD, small
+# enough that page margins and stamps cannot drown it.
+$script:OsdCropPx = 650
 
 # How the progress bar is weighted. One unit = one step spent on one page.
 # Both are set for real in Invoke-Run, once the path and the rotate setting are
@@ -425,21 +439,201 @@ function ConvertTo-OrientationDecision([hashtable]$Osd) {
     return @{ turn = 0; why = 'too little text to tell which way up it is - left alone' }
 }
 
+function Get-CropRects([int]$Width, [int]$Height, [int]$Count) {
+    # Where to cut the sample windows: centre first, then the four quadrants.
+    # A flat array of hashtables -- never an array of arrays (D-018 shape rule).
+    #
+    # A page must be big enough to hold windows that are actually DIFFERENT.
+    # Five windows cut from a page barely wider than one window overlap by ~93%
+    # and would vote as five copies of the same sample -- a stuffed ballot that
+    # looks like agreement. Below twice the window size, take the centre only.
+    # Exact duplicates are dropped too, for the same reason.
+    if ($Count -le 0) { return @() }
+    $size = [Math]::Min($script:OsdCropPx, [Math]::Min($Width, $Height))
+    if ($size -lt 64) { return @() }
+    if ($Width -lt (2 * $size) -or $Height -lt (2 * $size)) { $Count = 1 }
+    $fx = @(0.5, 0.28, 0.72, 0.28, 0.72)
+    $fy = @(0.5, 0.28, 0.28, 0.72, 0.72)
+    $rects = New-Object Collections.Generic.List[object]
+    $seen = New-Object Collections.Generic.HashSet[string]
+    for ($i = 0; $i -lt $Count -and $i -lt $fx.Count; $i++) {
+        $x = [int]([Math]::Round($fx[$i] * $Width) - $size / 2)
+        $y = [int]([Math]::Round($fy[$i] * $Height) - $size / 2)
+        if ($x -lt 0) { $x = 0 }
+        if ($y -lt 0) { $y = 0 }
+        if (($x + $size) -gt $Width)  { $x = $Width  - $size }
+        if (($y + $size) -gt $Height) { $y = $Height - $size }
+        if ($seen.Add("$x,$y")) { [void]$rects.Add(@{ x = $x; y = $y; size = $size }) }
+    }
+    return $rects.ToArray()
+}
+
+function New-OsdCrops([string]$Png, [int]$Count) {
+    # Cut the sample windows out of a rendered page. Flat array of file paths.
+    if ($Count -le 0) { return @() }
+    $out = New-Object Collections.Generic.List[string]
+    $src = [Drawing.Bitmap]::FromFile($Png)
+    try {
+        $rects = @(Get-CropRects $src.Width $src.Height $Count)
+        for ($i = 0; $i -lt $rects.Count; $i++) {
+            $r = $rects[$i]
+            $rect = New-Object Drawing.Rectangle([int]$r.x, [int]$r.y, [int]$r.size, [int]$r.size)
+            $crop = $src.Clone($rect, $src.PixelFormat)
+            try {
+                $path = "$Png.osd$i.png"
+                $crop.Save($path, [Drawing.Imaging.ImageFormat]::Png)
+                [void]$out.Add($path)
+            } finally { $crop.Dispose() }
+        }
+    } finally { $src.Dispose() }
+    return $out.ToArray()
+}
+
+function Get-CropVerdict([object[]]$Crops) {
+    # Tally the sample windows. Returns @{ decided; turn; why; voters }.
+    #
+    # Separate from Resolve-OrientationVote because the ANSWER TO decided
+    # decides whether the whole-page check has to run at all. On a page whose
+    # windows agree, it does not -- and that call is the expensive one
+    # (a full A4 at 300 dpi is ~20x the pixels of one 650 px window).
+    $tally = @{}
+    $voters = 0
+    foreach ($c in $Crops) {
+        if ($c.conf -lt $script:OsdConfidenceFloor) { continue }
+        $voters++
+        if ($tally.ContainsKey($c.turn)) { $tally[$c.turn] = $tally[$c.turn] + 1 }
+        else { $tally[$c.turn] = 1 }
+    }
+    $bestCount = 0
+    foreach ($k in $tally.Keys) { if ($tally[$k] -gt $bestCount) { $bestCount = $tally[$k] } }
+    $winners = New-Object Collections.Generic.List[int]
+    foreach ($k in $tally.Keys) { if ($tally[$k] -eq $bestCount) { [void]$winners.Add([int]$k) } }
+    if ($bestCount -ge 2 -and $winners.Count -eq 1) {
+        return @{ decided = $true; turn = $winners[0]
+                  why = "$bestCount of $voters samples agree"; voters = $voters }
+    }
+    return @{ decided = $false; turn = 0; why = ''; voters = $voters }
+}
+
+function Resolve-OrientationVote([object[]]$Crops, [hashtable]$FullPage) {
+    # Let the crops of one page vote, and fall back to the whole-page answer.
+    #
+    # $Crops are RAW OSD readings @{turn;conf}, deliberately not decisions.
+    # ConvertTo-OrientationDecision flattens "no confidence" into turn 0, which
+    # reads as a vote for "upright" -- a completely different claim from "no
+    # opinion". Voting on decisions would stuff the ballot with silent crops.
+    #
+    # Two crops agreeing beats the whole page, because the whole page is the
+    # measurement that is wrong ~10% of the time: at 300 dpi it is mostly
+    # margin, and border noise, stamps and footer text drag OSD off the body
+    # text. A 650 px window is body text or nothing.
+    #
+    # Crops that answer but disagree are the case nobody could see before: the
+    # page is kept on the whole-page answer, but the disagreement is said out
+    # loud, so a confidently wrong angle stops being indistinguishable from a
+    # confidently right one.
+    $v = Get-CropVerdict $Crops
+    if ($v.decided) { return @{ turn = $v.turn; why = $v.why } }
+    if ($v.voters -ge 2) {
+        return @{ turn = $FullPage.turn
+                  why  = "samples disagree ($($v.voters) answered) - fell back to the whole page: $($FullPage.why)" }
+    }
+    return $FullPage
+}
+
 function Get-OrientationBatch([string[]]$Pngs, [int]$Offset = 0, [int]$Total = 0) {
-    # The same `--psm 0` check as before, on the same full-resolution image --
-    # several tesseract processes at a time instead of one after another.
+    # Two rounds, and the second one usually runs for almost nobody.
+    #
+    #   round 1  -OsdCrops small windows per page, which vote
+    #   round 2  the whole-page `--psm 0` check -- ONLY for the pages whose
+    #            windows did not reach a majority
+    #
+    # The whole-page check is the expensive one: an A4 at 300 dpi is about 20x
+    # the pixels of one 650 px window. Running it on every page as well as the
+    # windows was pure waste, because a page whose windows agree never consults
+    # it. Five windows is roughly a quarter of the pixel work of the single
+    # whole-page call this replaces; what it adds is process launches, which is
+    # why -Jobs runs them in parallel and why -OsdCrops 3 is the cheap setting.
+    #
+    # -OsdCrops 0 skips round 1 entirely, which is exactly the old behaviour.
     if ($Pngs.Count -eq 0) { return @() }
-    $calls = New-Object Collections.Generic.List[object]
-    foreach ($png in $Pngs) {
-        [void]$calls.Add(@{ exe = $script:Tesseract; engineArgs = @($png, 'stdout', '--psm', '0', '-l', 'osd') })
-    }
-    $res = @(Invoke-EngineBatch $calls.ToArray() 'checking orientation of' $Offset `
-                ($(if ($Total) { $Total } else { $Pngs.Count })) 1 $false)
+    $total = $(if ($Total) { $Total } else { $Pngs.Count })
     $out = New-Object 'object[]' $Pngs.Count
-    for ($i = 0; $i -lt $Pngs.Count; $i++) {
-        $out[$i] = ConvertTo-OrientationDecision (ConvertFrom-OsdOutput ($res[$i].out + $res[$i].err))
+    $verdict = New-Object 'object[]' $Pngs.Count
+    $raw = New-Object 'object[]' $Pngs.Count
+
+    # --- round 1: the sample windows -------------------------------------
+    $cropFiles = New-Object Collections.Generic.List[string]
+    try {
+        if ($script:OsdCrops -gt 0) {
+            $calls = New-Object Collections.Generic.List[object]
+            $cropCount = New-Object 'int[]' $Pngs.Count
+            $firstCall = New-Object 'int[]' $Pngs.Count
+            for ($i = 0; $i -lt $Pngs.Count; $i++) {
+                $firstCall[$i] = $calls.Count
+                $crops = @(New-OsdCrops $Pngs[$i] $script:OsdCrops)
+                $cropCount[$i] = $crops.Count
+                foreach ($c in $crops) {
+                    [void]$cropFiles.Add($c)
+                    # min_characters_to_try only goes on the windows. A window
+                    # holds less text than a page and the default (50) makes OSD
+                    # refuse to try on samples that are perfectly readable.
+                    [void]$calls.Add(@{ exe = $script:Tesseract
+                                        engineArgs = @($c, 'stdout', '--psm', '0', '-l', 'osd',
+                                                       '-c', 'min_characters_to_try=20') })
+                }
+            }
+            # Silent: several calls per page would count past the page total.
+            # The stage line and the bar are stepped once per page at the end,
+            # still document-scoped (D-021).
+            $res = @(Invoke-EngineBatch $calls.ToArray() '' 0 0 0 $false)
+            for ($i = 0; $i -lt $Pngs.Count; $i++) {
+                $r = New-Object 'object[]' $cropCount[$i]
+                for ($k = 0; $k -lt $cropCount[$i]; $k++) {
+                    $one = $res[$firstCall[$i] + $k]
+                    $r[$k] = ConvertFrom-OsdOutput ($one.out + $one.err)
+                }
+                $raw[$i] = $r
+                $verdict[$i] = Get-CropVerdict $r
+            }
+        } else {
+            for ($i = 0; $i -lt $Pngs.Count; $i++) {
+                $raw[$i] = New-Object 'object[]' 0
+                $verdict[$i] = @{ decided = $false; turn = 0; why = ''; voters = 0 }
+            }
+        }
+
+        # --- round 2: the whole page, only where the windows could not decide -
+        $needFull = New-Object Collections.Generic.List[int]
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            if (-not $verdict[$i].decided) { [void]$needFull.Add($i) }
+        }
+        $fullRes = @()
+        if ($needFull.Count -gt 0) {
+            $calls2 = New-Object Collections.Generic.List[object]
+            foreach ($i in $needFull) {
+                [void]$calls2.Add(@{ exe = $script:Tesseract
+                                     engineArgs = @($Pngs[$i], 'stdout', '--psm', '0', '-l', 'osd') })
+            }
+            $fullRes = @(Invoke-EngineBatch $calls2.ToArray() '' 0 0 0 $false)
+        }
+
+        $slot = 0
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            if ($verdict[$i].decided) {
+                $out[$i] = @{ turn = $verdict[$i].turn; why = $verdict[$i].why }
+            } else {
+                $one = $fullRes[$slot]; $slot++
+                $full = ConvertTo-OrientationDecision (ConvertFrom-OsdOutput ($one.out + $one.err))
+                $out[$i] = Resolve-OrientationVote $raw[$i] $full
+            }
+            Show-Stage 'checking orientation of' ($Offset + $i + 1) $total
+            Update-Progress 1
+        }
+        return $out
+    } finally {
+        foreach ($c in $cropFiles) { Remove-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue }
     }
-    return $out
 }
 
 function Set-ImageRotation([string]$Png, [int]$Turn) {
@@ -573,10 +767,34 @@ function Test-PdfLibrary {
     } catch { return $false }
 }
 
+function Test-PageHasText([string]$Content, [int]$MinChars) {
+    # Does this page carry a real text layer, or only a stamp?
+    #
+    # The old test was "any letter or digit anywhere on the page", and it lost
+    # pages silently. A scan carrying a Bates number or a post-scan header
+    # stamp extracts about ten characters, passed as born-digital, and was
+    # never OCR'd -- the page shipped looking perfectly normal and searching it
+    # found nothing. So count the characters instead of asking whether any
+    # exist.
+    #
+    # \w is Unicode-aware in .NET (letters, marks and digits of any script), so
+    # Arabic counts here. The old [A-Za-z0-9] never matched Arabic at all,
+    # which rasterized and re-OCR'd every Arabic born-digital page.
+    #
+    # Being wrong low is safe and being wrong high is not: a real text page
+    # judged scanned gets rasterized and OCR'd, which is exactly what a scan
+    # gets anyway, while a scan judged born-digital loses its content for good.
+    # So the threshold leans toward OCR. A sparse born-digital page -- a cover
+    # sheet, a drawing with one caption -- falls below it and is OCR'd; that is
+    # the intended trade, not a bug. Retune with -TextMinChars.
+    if (-not $Content) { return $false }
+    return (($Content -replace '\W', '').Length -ge $MinChars)
+}
+
 function Get-PagesWithText([string]$Pdf, [int]$First, [int]$Last, [string]$WorkDir) {
     # Which pages already carry a real text layer (born-digital) and need no OCR.
     # One Ghostscript txtwrite pass for the whole document; the old code launched
-    # one per page. Any page whose extracted text has letters or digits has text.
+    # one per page. Test-PageHasText decides what counts as a text layer.
     # If the pass fails, every page is reported as needing OCR (the safe way to
     # be wrong).
     $count = $Last - $First + 1
@@ -598,7 +816,7 @@ function Get-PagesWithText([string]$Pdf, [int]$First, [int]$Last, [string]$WorkD
         if ($r.code -eq 0 -and $files.Count -eq $count) {
             for ($i = 0; $i -lt $count; $i++) {
                 $content = Get-Content -LiteralPath $files[$i].FullName -Raw -ErrorAction SilentlyContinue
-                $flags[$i] = [bool]($content -and ($content -match '[A-Za-z0-9]'))
+                $flags[$i] = [bool](Test-PageHasText $content $script:TextMinChars)
             }
         }
     } finally {
@@ -748,9 +966,12 @@ function Invoke-Run([hashtable]$Job) {
     $redo      = if ($opts.ContainsKey('redo')) { [bool]$opts.redo } else { $false }
     $dpi       = if ($opts.ContainsKey('dpi')) { [int]$opts.dpi } else { $Dpi }
     $mode      = if ($opts.ContainsKey('mode')) { [string]$opts.mode } else { $Mode }
-    # Speed knobs may also come from job.json so the GUI can expose them later.
+    # These knobs may also come from job.json so the GUI can expose them later.
+    # text_min is not a speed knob -- it decides which pages get OCR'd (D-023).
     if ($opts.ContainsKey('jobs'))   { $script:MaxParallel = [Math]::Max(1, [int]$opts.jobs) }
     if ($opts.ContainsKey('chunk'))  { $script:ChunkPages  = [Math]::Max(1, [int]$opts.chunk) }
+    if ($opts.ContainsKey('text_min')) { $script:TextMinChars = [Math]::Max(1, [int]$opts.text_min) }
+    if ($opts.ContainsKey('osd_crops')) { $script:OsdCrops = [Math]::Max(0, [Math]::Min(5, [int]$opts.osd_crops)) }
 
     if (-not (Test-Path -LiteralPath $outputDir -PathType Container)) {
         Emit 'fatal' @{ text = "Output folder does not exist: $outputDir" }; return 2
@@ -820,6 +1041,8 @@ function Invoke-Run([hashtable]$Job) {
         Write-Report $report "Output: $outputDir"
         Write-Report $report ("Options: lang=$lang rotate=$rotate dpi=$dpi")
         Write-Report $report ("Speed: jobs=$($script:MaxParallel) chunk=$($script:ChunkPages)")
+        # Recorded because it is the answer to "why was this page not OCR'd?".
+        Write-Report $report ("Text layer threshold: $($script:TextMinChars) character(s)")
     }
     Write-Report $report ("Path: {0}" -f $(if ($useB) { 'B (lossless)' } else { 'A (rasterize)' }))
 
@@ -958,6 +1181,103 @@ function Invoke-SelfTestBody {
     Check 'whole document needs no name suffix' ((Get-RangeSuffix 1 350 350) -eq '')
     Check 'part document is named for its pages' ((Get-RangeSuffix 5 120 350) -eq '_p5-120')
     Check 'single page is named for its page' ((Get-RangeSuffix 7 7 350) -eq '_p7')
+
+    # "Already has text" is a threshold, not a yes/no. The old test passed a
+    # page with one character on it, so a scan wearing a Bates number or a
+    # header stamp was filed as born-digital and never OCR'd -- silently, and
+    # the output looked fine.
+    $prose  = 'x' * 300
+    $bates  = 'SMITH-000123'
+    $stamp  = 'SCANNED 12 MAR 2026 - RECORDS DEPT - COPY 2 OF 3'
+    $arabic = ([string][char]0x0627) * 150   # 150 Arabic letters, written in ASCII
+    $padded = $stamp + ('-' * 400)
+    $exact  = 'x' * 100
+    $short  = 'x' * 99
+    Check 'a blank page needs OCR' (-not (Test-PageHasText '' 100))
+    Check 'a null page needs OCR' (-not (Test-PageHasText $null 100))
+    Check 'whitespace and punctuation are not text' (-not (Test-PageHasText " . - / `n`t " 100))
+    Check 'a Bates number is not a text layer' (-not (Test-PageHasText $bates 100))
+    Check 'a header stamp is not a text layer' (-not (Test-PageHasText $stamp 100))
+    Check 'a real page of text is a text layer' (Test-PageHasText $prose 100)
+    Check 'an Arabic page of text is a text layer' (Test-PageHasText $arabic 100)
+    Check 'punctuation does not pad a stamp over the line' (-not (Test-PageHasText $padded 100))
+    Check 'threshold is inclusive' (Test-PageHasText $exact 100)
+    Check 'one character short needs OCR' (-not (Test-PageHasText $short 100))
+
+    # Crop geometry. The trap is duplicates: on a small page every spot clamps
+    # to the same rectangle, and five copies of one sample would look exactly
+    # like five samples agreeing.
+    $a4 = @(Get-CropRects 2480 3508 5)
+    Check 'A4 gives five distinct sample windows' ($a4.Count -eq 5)
+    Check 'sample windows are the configured size' ($a4[0].size -eq $script:OsdCropPx)
+    Check 'sample windows stay inside the page' (
+        -not ($a4 | Where-Object { $_.x -lt 0 -or $_.y -lt 0 -or
+                                   ($_.x + $_.size) -gt 2480 -or ($_.y + $_.size) -gt 3508 }))
+    Check 'no two windows share a corner' (
+        (@($a4 | ForEach-Object { "$($_.x),$($_.y)" } | Sort-Object -Unique)).Count -eq 5)
+    Check 'a page too small to space windows out gives one, not five' (
+        (@(Get-CropRects 700 700 5)).Count -eq 1)
+    Check 'a page exactly one window wide gives one' (
+        (@(Get-CropRects 650 650 5)).Count -eq 1)
+    Check 'a page too small to sample gives none' ((@(Get-CropRects 50 50 5)).Count -eq 0)
+    Check 'zero crops requested gives none' ((@(Get-CropRects 2480 3508 0)).Count -eq 0)
+
+    # The vote. A silent crop must not count as a vote for "upright" -- that is
+    # why the vote reads raw OSD and not a decision.
+    $pageSaysUpright = @{ turn = 0; why = 'already upright, confidence 3.00' }
+    $pageSays180     = @{ turn = 180; why = 'confidence 3.00' }
+    $pageSaysNothing = @{ turn = 0; why = 'too little text to tell which way up it is - left alone' }
+    $silent = @(@{ turn = 0; conf = 0.0 }, @{ turn = 0; conf = 0.0 }, @{ turn = 0; conf = 0.0 })
+
+    $agree = @(@{ turn = 90; conf = 4.0 }, @{ turn = 90; conf = 3.0 }, @{ turn = 0; conf = 0.0 })
+    $v = Resolve-OrientationVote $agree $pageSaysNothing
+    Check 'two agreeing samples rescue a page the whole page could not read' (
+        $v.turn -eq 90 -and $v.why -like '*samples agree*')
+
+    # The confidently-wrong case: the page is sure and wrong, the samples are not.
+    $sayUpright = @(@{ turn = 0; conf = 4.0 }, @{ turn = 0; conf = 3.5 }, @{ turn = 0; conf = 2.0 })
+    $v = Resolve-OrientationVote $sayUpright $pageSays180
+    Check 'agreeing samples overrule a confident whole page' ($v.turn -eq 0)
+
+    $split = @(@{ turn = 90; conf = 4.0 }, @{ turn = 180; conf = 3.0 }, @{ turn = 270; conf = 2.0 })
+    $v = Resolve-OrientationVote $split $pageSays180
+    Check 'samples that all disagree fall back to the whole page' ($v.turn -eq 180)
+    Check 'a disagreement is said out loud' ($v.why -like '*disagree*')
+
+    $tie = @(@{ turn = 90; conf = 4.0 }, @{ turn = 90; conf = 4.0 },
+             @{ turn = 270; conf = 4.0 }, @{ turn = 270; conf = 4.0 })
+    $v = Resolve-OrientationVote $tie $pageSaysUpright
+    Check 'a tied vote does not pick a side' ($v.turn -eq 0 -and $v.why -like '*disagree*')
+
+    $v = Resolve-OrientationVote $silent $pageSays180
+    Check 'silent samples are not votes for upright' ($v.turn -eq 180 -and $v.why -eq $pageSays180.why)
+    $v = Resolve-OrientationVote @(@{ turn = 90; conf = 4.0 }) $pageSaysNothing
+    Check 'one lone sample is not a majority' ($v.turn -eq 0)
+    $v = Resolve-OrientationVote @() $pageSays180
+    Check 'no samples at all leaves the whole page answer untouched' (
+        $v.turn -eq 180 -and $v.why -eq $pageSays180.why)
+
+    # The verdict is what decides whether the expensive whole-page check runs
+    # at all, so "decided" carries a cost, not just an answer.
+    $d = Get-CropVerdict $agree
+    Check 'an agreed verdict is decided' ($d.decided -and $d.turn -eq 90)
+    $d = Get-CropVerdict $split
+    Check 'a split verdict is undecided but counts its voters' (
+        -not $d.decided -and $d.voters -eq 3)
+    $d = Get-CropVerdict $tie
+    Check 'a tied verdict is undecided' (-not $d.decided)
+    $d = Get-CropVerdict $silent
+    Check 'silent samples decide nothing and vote nothing' (
+        -not $d.decided -and $d.voters -eq 0)
+    $d = Get-CropVerdict @()
+    Check 'no samples decides nothing' (-not $d.decided -and $d.voters -eq 0)
+
+    # The whole point of the split: a page whose windows agree must not pay for
+    # the whole-page check. Count how many pages would still need it.
+    $pages = @((Get-CropVerdict $agree), (Get-CropVerdict $split),
+               (Get-CropVerdict $sayUpright), (Get-CropVerdict $silent))
+    Check 'only the undecided pages need the whole-page check' (
+        (@($pages | Where-Object { -not $_.decided })).Count -eq 2)
 
     Check 'batch end, full batch' ((Get-ChunkEnd 5 0 2) -eq 1)
     Check 'batch end, next batch' ((Get-ChunkEnd 5 2 2) -eq 3)
