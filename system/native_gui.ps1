@@ -112,6 +112,11 @@ if (-not $SelfTest) {
 
 $Strings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'native_strings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 
+# Shown in the Redo OCR tooltip so the default behaviour is explained where the
+# option is. It mirrors -TextMinChars in native_worker.ps1 (D-023); if that
+# default changes, change this too -- the worker cannot be asked from here.
+$script:TextMinCharsDefault = 100
+
 if ($SelfTest) {
     # Wrapped for the same reason as above. This line is also the regression
     # test: on a healthy install Get-MissingFiles returns nothing, which is the
@@ -130,6 +135,13 @@ if ($SelfTest) {
     if ($enKeys.Count -ne $arKeys.Count -or (Compare-Object $enKeys $arKeys)) {
         throw ('Interface text differs between languages: ' +
                (@(Compare-Object $enKeys $arKeys | ForEach-Object { $_.InputObject }) -join ', '))
+    }
+    # Any stray { or } in a translation makes -f throw at the moment the
+    # tooltip is set, which is after the window is already up. Format both
+    # languages here, where it is a failed self-test instead of a live crash.
+    foreach ($lang in @('en', 'ar')) {
+        try { $null = ($Strings.$lang.redo_help -f 100) }
+        catch { throw "The $lang 'redo_help' text is not a valid format string: $($_.Exception.Message)" }
     }
     Write-Output ("native GUI selftest ok - WinForms loaded, " +
                   "$(@(Get-RequiredFiles).Count) required files present, " +
@@ -283,6 +295,15 @@ $RedoCheck.Location = New-Object System.Drawing.Point(16, 89)
 $RedoCheck.Size = New-Object System.Drawing.Size(480, 25)
 $SettingsGroup.Controls.Add($RedoCheck)
 
+# What "Redo OCR" actually does, and what happens when it is off, on hover.
+# A tooltip rather than a label under the checkbox: the settings panel is full
+# (the Arabic warning already sits on the last free row) and growing it means
+# moving every control below it, which cannot be checked from the build machine.
+$Tips = New-Object System.Windows.Forms.ToolTip
+$Tips.AutoPopDelay = 20000     # long enough to read three lines
+$Tips.InitialDelay = 350
+$Tips.ReshowDelay = 100
+
 $ArabicWarning = New-Object System.Windows.Forms.Label
 $ArabicWarning.Location = New-Object System.Drawing.Point(16, 116)
 $ArabicWarning.Size = New-Object System.Drawing.Size(500, 22)
@@ -385,6 +406,9 @@ function Apply-Language {
     $LanguageLabel.Text = $text.language
     $RotateCheck.Text = $text.rotate
     $RedoCheck.Text = $text.redo
+    # -f, because the number is the worker's -TextMinChars default and belongs
+    # in one place in this file rather than written into both translations.
+    $Tips.SetToolTip($RedoCheck, ($text.redo_help -f $script:TextMinCharsDefault))
     $ArabicWarning.Text = $text.arabic_warning
     $OutputGroup.Text = $text.output
     $BrowseButton.Text = $text.browse

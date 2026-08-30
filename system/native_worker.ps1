@@ -44,7 +44,10 @@
       covers both the render and the born-digital text scan.
     - Invoke-EngineBatch reports each parallel process the moment it exits,
       rather than waiting for a whole wave of four -- that wait was what made
-      the count jump 4, 8, 12.
+      the count jump 4, 8, 12. A call may also carry a `label`, which is
+      written to the log at that same instant; that is how recognition says
+      "Page 7: text recognised" while the run is still going. Under -Jobs the
+      pages finish out of order, so those lines are not sorted by page.
     - Assembly reports per page as pages are added.
   The progress bar uses the same idea: a page is worth one unit per step that
   will actually be spent on it, so the bar advances at the same rate in every
@@ -322,7 +325,16 @@ function Invoke-EngineWatched {
 function Invoke-EngineBatch {
     # Run several bundled-exe calls with up to -Jobs alive at once, and return
     # their results in the order they were given. Each call is
-    # @{ exe = <path>; engineArgs = @(...) }.
+    # @{ exe = <path>; engineArgs = @(...); label = <optional log line> }.
+    #
+    # A call carrying a `label` writes that line to the log the instant its own
+    # process exits. That is the only place it CAN be written from: this
+    # function does not return until the whole batch is done, so a caller
+    # looping over the results afterwards would print a chunk's worth of lines
+    # all at once, which is the silence D-021 exists to prevent. The cost of
+    # writing them as they land is that pages finish out of order under -Jobs,
+    # so the page numbers in the log are not sorted. That is real -- they
+    # genuinely finished in that order.
     #
     # The pool is kept full: the moment one page exits, the next one starts.
     # The old version launched four, waited for all four, then launched four
@@ -352,6 +364,9 @@ function Invoke-EngineBatch {
             $results[$b.index] = Complete-Engine $b
             $running.RemoveAt($j)
             $finished++
+            if ($Calls[$b.index].ContainsKey('label')) {
+                Emit 'log' @{ kind = 'dim'; text = $Calls[$b.index].label }
+            }
             if ($Verb) { Show-Stage $Verb ($Offset + $finished) $Total }
             Update-Progress $ProgressUnits
             if ($StepDocument) { Step-Document 1 }
@@ -900,6 +915,7 @@ function Invoke-OneDocumentLossless {
                 exe = $script:Tesseract
                 engineArgs = @($pngs[$k], (Join-Path $chunkDir ("p{0:D5}" -f $slice[$k])),
                                '--dpi', "$Dpi", '-l', $Lang, 'pdf')
+                label = "Page $($slice[$k]): text recognised"
             })
         }
         # The file row and the bar move as each page's own process exits, from
@@ -1344,12 +1360,22 @@ function Invoke-SelfTestBody {
         # scheduler bug would hang or drop a result.
         $many = New-Object Collections.Generic.List[object]
         for ($p = 0; $p -lt ($script:MaxParallel * 2 + 1); $p++) {
-            [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h') })
+            # Half of them carry a log label and half do not, so both branches
+            # of the per-exit log line run. A call with no 'label' key must not
+            # throw under Set-StrictMode 2.0, which is the whole risk here.
+            if (($p % 2) -eq 0) {
+                [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h')
+                                   label = "Page ${p}: text recognised" })
+            } else {
+                [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h') })
+            }
         }
         $refill = @(Invoke-EngineBatch $many.ToArray())
         Check 'pool refills past the first wave' (
             $refill.Count -eq $many.Count -and
             (($refill | Where-Object { $_.code -eq 0 }).Count -eq $many.Count))
+        Check 'labelled and unlabelled calls both survive the runner' (
+            $refill.Count -eq $many.Count)
 
         # And the watched runner: one process, one file per page, counted as
         # they land. Ghostscript renders its own bundled example to prove it.
