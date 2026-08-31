@@ -44,7 +44,10 @@
     "range_from": "Pages",
     "range_to": "to",
     "range_ok": "Apply",
-    "redo_help": "Off by default. Only pages with no text layer are read, and a page holding fewer than {0} characters counts as having none - a scan carrying just a stamp or a page number is read too.\n\nTick this if a document already has a bad text layer and you want every page read again from the image. It is slower: nothing is skipped."
+    "redo_help": "Off by default. Only pages with no text layer are read, and a page holding fewer than {0} characters counts as having none - a scan carrying just a stamp or a page number is read too.\n\nTick this if a document already has a bad text layer and you want every page read again from the image. It is slower: nothing is skipped.",
+    "search_hint": "find a page number or text",
+    "search_none": "no match",
+    "search_hits": "{0} line(s)"
   },
   "ar": {
     "title": "التعرف الضوئي على المستندات",
@@ -91,6 +94,9 @@
     "range_from": "من",
     "range_to": "إلى",
     "range_ok": "تطبيق",
-    "redo_help": "غير مفعّل افتراضيًا. تُقرأ فقط الصفحات التي لا تحتوي على طبقة نص، والصفحة التي تحتوي على أقل من {0} حرفًا تُعدّ بلا نص - فالصفحة الممسوحة ضوئيًا التي لا تحمل سوى ختم أو رقم صفحة تُقرأ أيضًا.\n\nفعّل هذا الخيار إذا كان المستند يحتوي بالفعل على طبقة نص سيئة وتريد إعادة قراءة كل صفحة من الصورة. وهو أبطأ، لأنه لا يتخطّى أي صفحة."
+    "redo_help": "غير مفعّل افتراضيًا. تُقرأ فقط الصفحات التي لا تحتوي على طبقة نص، والصفحة التي تحتوي على أقل من {0} حرفًا تُعدّ بلا نص - فالصفحة الممسوحة ضوئيًا التي لا تحمل سوى ختم أو رقم صفحة تُقرأ أيضًا.\n\nفعّل هذا الخيار إذا كان المستند يحتوي بالفعل على طبقة نص سيئة وتريد إعادة قراءة كل صفحة من الصورة. وهو أبطأ، لأنه لا يتخطّى أي صفحة.",
+    "search_hint": "ابحث برقم الصفحة أو بنص",
+    "search_none": "لا توجد نتيجة",
+    "search_hits": "{0} سطر"
   }
 }

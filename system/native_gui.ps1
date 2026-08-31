@@ -117,6 +117,23 @@ $Strings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'native_strings.jso
 # default changes, change this too -- the worker cannot be asked from here.
 $script:TextMinCharsDefault = 100
 
+function Test-LogLineMatch([string]$Line, [string]$Query) {
+    # What the log search counts as a hit on one line.
+    #
+    # A bare number means A PAGE NUMBER, not "any line with that digit in it".
+    # Typing 5 must not light up "Page 15", "5 of 22 page(s) already have text"
+    # or a confidence of 5.00 -- the whole point is to read one page's story on
+    # its own. Anything that is not a bare number is a plain case-insensitive
+    # substring, so "turned" or "no words" still work.
+    if ([string]::IsNullOrWhiteSpace($Query)) { return $false }
+    if ([string]::IsNullOrEmpty($Line)) { return $false }
+    $q = $Query.Trim()
+    if ($q -match '^[0-9]+$') {
+        return [bool]($Line -match ('^\s*Page\s+0*' + $q + '\s*:'))
+    }
+    return $Line.ToLowerInvariant().Contains($q.ToLowerInvariant())
+}
+
 if ($SelfTest) {
     # Wrapped for the same reason as above. This line is also the regression
     # test: on a healthy install Get-MissingFiles returns nothing, which is the
@@ -140,8 +157,26 @@ if ($SelfTest) {
     # tooltip is set, which is after the window is already up. Format both
     # languages here, where it is a failed self-test instead of a live crash.
     foreach ($lang in @('en', 'ar')) {
-        try { $null = ($Strings.$lang.redo_help -f 100) }
-        catch { throw "The $lang 'redo_help' text is not a valid format string: $($_.Exception.Message)" }
+        foreach ($key in @('redo_help', 'search_hits')) {
+            try { $null = ($Strings.$lang.$key -f 100) }
+            catch { throw "The $lang '$key' text is not a valid format string: $($_.Exception.Message)" }
+        }
+    }
+    # The log search. A bare number is a page number, never a substring --
+    # that distinction is the whole feature and it is invisible in the UI.
+    $searchCases = @(
+        @{ line = 'Page 5: upright - five common words'; q = '5'; hit = $true },
+        @{ line = 'Page 15: turned 180 cw - a word from your list'; q = '5'; hit = $false },
+        @{ line = 'scan.pdf - 5 of 22 page(s) already have text'; q = '5'; hit = $false },
+        @{ line = 'Page 7: upright - no words matched, confidence 5.00'; q = '5'; hit = $false },
+        @{ line = 'Page 8: TEXT LAYER ADDED'; q = 'text layer'; hit = $true },
+        @{ line = 'Page 8: text layer added'; q = '  '; hit = $false },
+        @{ line = ''; q = '5'; hit = $false }
+    )
+    foreach ($case in $searchCases) {
+        if ((Test-LogLineMatch $case.line $case.q) -ne $case.hit) {
+            throw ("Log search is wrong for '" + $case.q + "' on '" + $case.line + "'")
+        }
     }
     Write-Output ("native GUI selftest ok - WinForms loaded, " +
                   "$(@(Get-RequiredFiles).Count) required files present, " +
@@ -161,6 +196,18 @@ $script:Process = $null
 $script:JobDir = $null
 $script:EventReader = $null
 $script:InterfaceLanguage = 'en'
+# The active log search. Whether the log follows its own tail is not tracked:
+# Append-Log asks the box where it actually is, every line.
+$script:LogQuery = ''
+# Which build this is, written into the package by package_pc.sh and absent in
+# a working copy. Shown in the window BEFORE anything is run: the log only says
+# it once a job starts, which is no help to someone asking "did the new copy
+# actually land on this PC?".
+$script:BuildStamp = ''
+$script:BuildFile = Join-Path $PSScriptRoot 'build.txt'
+if (Test-Path -LiteralPath $script:BuildFile) {
+    $script:BuildStamp = ((Get-Content -LiteralPath $script:BuildFile -Raw -ErrorAction SilentlyContinue) + '').Trim()
+}
 
 $Font = New-Object System.Drawing.Font('Segoe UI', 9)
 $MonoFont = New-Object System.Drawing.Font('Consolas', 9)
@@ -351,15 +398,34 @@ $Progress.Minimum = 0
 $Progress.Maximum = 100
 $ActivityGroup.Controls.Add($Progress)
 
+$SearchBox = New-Object System.Windows.Forms.TextBox
+$SearchBox.Location = New-Object System.Drawing.Point(16, 86)
+$SearchBox.Size = New-Object System.Drawing.Size(330, 22)
+$SearchBox.Anchor = 'Top,Left,Right'
+$SearchBox.Font = $MonoFont
+$ActivityGroup.Controls.Add($SearchBox)
+
+# Doubles as the hint. WinForms 4.x has no placeholder text, and a second
+# label just to say "type here" is a control that earns nothing.
+$MatchLabel = New-Object System.Windows.Forms.Label
+$MatchLabel.Location = New-Object System.Drawing.Point(354, 89)
+$MatchLabel.Size = New-Object System.Drawing.Size(158, 20)
+$MatchLabel.Anchor = 'Top,Right'
+$MatchLabel.ForeColor = [System.Drawing.Color]::FromArgb(91, 107, 123)
+$ActivityGroup.Controls.Add($MatchLabel)
+
 $LogBox = New-Object System.Windows.Forms.RichTextBox
-$LogBox.Location = New-Object System.Drawing.Point(16, 86)
-$LogBox.Size = New-Object System.Drawing.Size(496, 414)
+$LogBox.Location = New-Object System.Drawing.Point(16, 114)
+$LogBox.Size = New-Object System.Drawing.Size(496, 386)
 $LogBox.Anchor = 'Top,Bottom,Left,Right'
 $LogBox.ReadOnly = $true
 $LogBox.BackColor = [System.Drawing.Color]::FromArgb(21, 32, 43)
 $LogBox.ForeColor = [System.Drawing.Color]::White
 $LogBox.Font = $MonoFont
 $LogBox.WordWrap = $false
+# Dark amber: readable behind every log colour on this background, and not
+# mistakable for the green/red an outcome uses.
+$script:LogHitColour = [System.Drawing.Color]::FromArgb(94, 74, 18)
 $ActivityGroup.Controls.Add($LogBox)
 
 $StartButton = New-Object System.Windows.Forms.Button
@@ -394,7 +460,8 @@ function Apply-Language {
     $text = Get-TextSet
     $Form.Text = $text.title
     $Header.Text = $text.title
-    $Subtitle.Text = $text.subtitle
+    $Subtitle.Text = $(if ($script:BuildStamp) {
+        "$($text.subtitle)   -   build $script:BuildStamp" } else { $text.subtitle })
     $InterfaceLabel.Text = $text.interface
     $DocumentsGroup.Text = $text.documents
     $DropHint.Text = $text.drop
@@ -413,6 +480,7 @@ function Apply-Language {
     $OutputGroup.Text = $text.output
     $BrowseButton.Text = $text.browse
     $ActivityGroup.Text = $text.activity
+    if ([string]::IsNullOrWhiteSpace($script:LogQuery)) { $MatchLabel.Text = $text.search_hint }
     $StartButton.Text = $text.start
     $CancelButton.Text = $text.cancel
     $OpenOutputButton.Text = $text.open_output
@@ -442,12 +510,84 @@ function Append-Log([string]$Text, [string]$Kind = 'plain') {
         'dim' { [System.Drawing.Color]::FromArgb(145, 161, 177) }
         default { [System.Drawing.Color]::White }
     }
+    # Where the top of the view is right now. Only needed when the user has
+    # scrolled up: AppendText always jumps to the end, so the way to stay put
+    # is to scroll back to this character afterwards.
+    #
+    # Asked here, every time, rather than tracked by the VScroll event: a mouse
+    # wheel does not reliably raise VScroll on a RichTextBox, so a flag kept by
+    # that event stayed "following" no matter how far up the user scrolled.
+    # Reading the actual position cannot be out of step with the actual view.
+    $keepTop = -1
+    if (-not (Test-LogAtBottom)) {
+        $keepTop = $LogBox.GetCharIndexFromPosition((New-Object System.Drawing.Point(2, 2)))
+    }
     $LogBox.SelectionStart = $LogBox.TextLength
     $LogBox.SelectionLength = 0
     $LogBox.SelectionColor = $colour
+    $LogBox.SelectionBackColor = $(if (Test-LogLineMatch $Text $script:LogQuery) {
+        $script:LogHitColour } else { $LogBox.BackColor })
     $LogBox.AppendText($Text + [Environment]::NewLine)
     $LogBox.SelectionColor = $LogBox.ForeColor
+    $LogBox.SelectionBackColor = $LogBox.BackColor
+    if ($keepTop -ge 0) {
+        # ponytail: line-granular, not pixel-exact -- ScrollToCaret puts the
+        # saved line back at the top of the view, which is close enough to
+        # "nothing moved" to read as still. Pixel-exact needs EM_GETSCROLLPOS.
+        $LogBox.SelectionStart = $keepTop
+        $LogBox.SelectionLength = 0
+    }
     $LogBox.ScrollToCaret()
+}
+
+function Clear-Log {
+    # A new run starts at the tail with no stale search state. Without this a
+    # held scroll position and a query from the previous run survive into a log
+    # that no longer has those lines.
+    $LogBox.Clear()
+    $script:LogQuery = ''
+    $SearchBox.Text = ''
+    $MatchLabel.Text = (Get-TextSet).search_hint
+}
+
+function Test-LogAtBottom {
+    if ($LogBox.TextLength -eq 0) { return $true }
+    $foot = New-Object System.Drawing.Point(2, ($LogBox.ClientSize.Height - 2))
+    $lastVisible = $LogBox.GetLineFromCharIndex($LogBox.GetCharIndexFromPosition($foot))
+    return ($lastVisible -ge ($LogBox.GetLineFromCharIndex($LogBox.TextLength) - 1))
+}
+
+function Update-LogSearch {
+    # Repaint every line's background for the current query, and show the
+    # first hit. Runs on Enter, not on every keystroke: each SelectionBackColor
+    # write repaints, and on a 350-page log that is thousands of them.
+    $text = Get-TextSet
+    $LogBox.SelectionStart = 0
+    $LogBox.SelectionLength = $LogBox.TextLength
+    $LogBox.SelectionBackColor = $LogBox.BackColor
+    $LogBox.SelectionLength = 0
+    $hits = 0
+    $firstLine = -1
+    $lines = @($LogBox.Lines)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if (-not (Test-LogLineMatch $lines[$i] $script:LogQuery)) { continue }
+        $start = $LogBox.GetFirstCharIndexFromLine($i)
+        if ($start -lt 0) { continue }
+        $LogBox.SelectionStart = $start
+        $LogBox.SelectionLength = $lines[$i].Length
+        $LogBox.SelectionBackColor = $script:LogHitColour
+        $hits++
+        if ($firstLine -lt 0) { $firstLine = $i }
+    }
+    $LogBox.SelectionLength = 0
+    if ([string]::IsNullOrWhiteSpace($script:LogQuery)) { $MatchLabel.Text = $text.search_hint }
+    elseif ($hits -eq 0) { $MatchLabel.Text = $text.search_none }
+    else { $MatchLabel.Text = ($text.search_hits -f $hits) }
+    if ($firstLine -ge 0) {
+        $LogBox.SelectionStart = $LogBox.GetFirstCharIndexFromLine($firstLine)
+        $LogBox.SelectionLength = 0
+        $LogBox.ScrollToCaret()
+    }
 }
 
 function Get-RangeText($Range) {
@@ -772,7 +912,7 @@ function Start-Run {
     $script:SummarySeen = $false
     $script:Results.Clear()
     $Progress.Value = 0
-    $LogBox.Clear()
+    Clear-Log
     foreach ($item in $FileList.Items) { $item.SubItems[3].Text = $text.queued }
 
     $script:JobDir = Join-Path ([IO.Path]::GetTempPath()) ('document_ocr_' + [Guid]::NewGuid().ToString('N'))
@@ -861,7 +1001,7 @@ $ClearButton.Add_Click({
     $script:PageRanges.Clear()
     $script:Results.Clear()
     $FileList.Items.Clear()
-    $LogBox.Clear()
+    Clear-Log
     $Progress.Value = 0
     $StageLabel.Text = (Get-TextSet).ready
     Refresh-Controls
@@ -879,6 +1019,19 @@ $LanguageChoice.Add_SelectedIndexChanged({
 $InterfaceChoice.Add_SelectedIndexChanged({
     $script:InterfaceLanguage = if ($InterfaceChoice.SelectedIndex -eq 1) { 'ar' } else { 'en' }
     Apply-Language
+})
+# Enter searches; Escape clears. Not on every keystroke -- see Update-LogSearch.
+$SearchBox.Add_KeyDown({
+    if ($_.KeyCode -eq 'Return') {
+        $_.SuppressKeyPress = $true
+        $script:LogQuery = $SearchBox.Text
+        Update-LogSearch
+    } elseif ($_.KeyCode -eq 'Escape') {
+        $_.SuppressKeyPress = $true
+        $SearchBox.Text = ''
+        $script:LogQuery = ''
+        Update-LogSearch
+    }
 })
 $StartButton.Add_Click({ Start-Run })
 $CancelButton.Add_Click({

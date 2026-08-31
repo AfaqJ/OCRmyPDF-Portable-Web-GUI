@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy this to orientation_words.json and list exact words that prove a page is readable. The local file is ignored by git. These words are checked anywhere on the page and never written to logs.",
+  "words": ["Northstar", "Acme"]
+}

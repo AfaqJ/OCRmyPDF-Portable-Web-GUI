@@ -12,3 +12,7 @@ docs/DECISIONS.md
 docs/STATE.md
 # Troubleshooting output written at runtime. Not part of the tool.
 system/logs/
+
+# Local, untracked: exact orientation words for whoever uses this copy.
+# A future generic push includes the algorithm, never this private vocabulary.
+system/orientation_words.json

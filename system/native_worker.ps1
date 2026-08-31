@@ -11,19 +11,19 @@
   driven from PowerShell (.NET, always allowed).
 
   This file is "Path A": the engines-only, rasterizing path. It re-renders each
-  page to an image, corrects orientation with Tesseract's own detector
-  (-OsdCrops sample windows of the page vote; the whole-page check prerotate.py
-  used is the fallback, and only runs when they cannot agree -- D-024), and lets
-  Tesseract emit a searchable PDF with an invisible text layer. For scanned documents the result is visually identical
+  page to an image, tries full-page recognition at each possible orientation
+  until strong language evidence is found, then falls back to Tesseract's OSD
+  sample windows and whole-page detector when words cannot decide. Tesseract
+  emits a searchable PDF with an invisible text layer. For scanned documents the result is visually identical
   to OCRmyPDF's output at the same resolution. Path B (a lossless text overlay
   onto the original page, via a .NET PDF library) layers on top of this later
   and falls back to this path if the library is unavailable.
 
   Where the time goes
   -------------------
-  Every page costs one Ghostscript render, one or more Tesseract orientation
-  checks and one Tesseract OCR pass. That work is irreducible. What was reducible was the
-  overhead wrapped around it:
+  Every page costs one Ghostscript render and one or more Tesseract recognition
+  passes. Path B keeps the pass that proves orientation as the final page PDF;
+  Path A must build its combined PDF afterward. What was reducible was the overhead:
     - Ghostscript renders a batch of pages per process (-ChunkPages, default
       10), not one page per process, so a 350-page PDF is opened ~35 times
       instead of 350.
@@ -46,7 +46,7 @@
       rather than waiting for a whole wave of four -- that wait was what made
       the count jump 4, 8, 12. A call may also carry a `label`, which is
       written to the log at that same instant; that is how recognition says
-      "Page 7: text recognised" while the run is still going. Under -Jobs the
+      "Page 7: text layer added" while the run is still going. Under -Jobs the
       pages finish out of order, so those lines are not sorted by page.
     - Assembly reports per page as pages are added.
   The progress bar uses the same idea: a page is worth one unit per step that
@@ -91,7 +91,11 @@ param(
     # How many small crops of each page get their own orientation check and
     # vote. 0 = ask the whole page once, which is what this did before.
     # See Get-OrientationBatch.
-    [int]$OsdCrops = 5
+    [int]$OsdCrops = 5,
+    # Exact words that prove which way up a page reads. EMPTY BY DEFAULT: keep
+    # document-specific words in ignored system\orientation_words.json (see
+    # orientation_words.example.json), or pass generic ones here.
+    [string[]]$PriorityWords = @()
 )
 
 Set-StrictMode -Version 2.0
@@ -119,6 +123,52 @@ $script:OsdCrops = [Math]::Max(0, [Math]::Min(5, $OsdCrops))
 # 300 dpi that is about 2.2 inches -- enough body text for OSD, small
 # enough that page margins and stamps cannot drown it.
 $script:OsdCropPx = 650
+# Full recognition tries upright first, then the common upside-down case, then
+# the two sideways cases. A page stops at the first rotation with strong text.
+$script:OrientationTurns = @(0, 180, 90, 270)
+$script:WordConfidence = 70.0
+# ONE number, one rule. Every known word read on a rotation is worth one point,
+# EVERY TIME IT APPEARS. No word classes, no caps, no second tier: a hit is a
+# hit. Months, years and abbreviations are ordinary words and score the same.
+#
+# Three points stops the search -- one word three times, three different words,
+# or any mix. A word from the private list passes on its own, immediately.
+#
+# The same number also picks the winning rotation when nothing reaches three,
+# so a page that scores 1 is still read as upright rather than handed to OSD.
+$script:ScoreToDecide = 3
+$script:ScorePriority = 1000
+$script:PriorityWords = @($PriorityWords | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+if ($script:PriorityWords.Count -eq 0 -and -not $PSBoundParameters.ContainsKey('PriorityWords')) {
+    # Not tracked by git on purpose. What is written on someone's documents is
+    # theirs, and this repository is a generic tool.
+    $wordFile = Join-Path $PSScriptRoot 'orientation_words.json'
+    if (Test-Path -LiteralPath $wordFile) {
+        try {
+            $loaded = (Get-Content -LiteralPath $wordFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+            $script:PriorityWords = @($loaded.words | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+        } catch { $script:PriorityWords = @() }
+    }
+}
+$script:PriorityWordSet = @{}
+foreach ($word in $script:PriorityWords) {
+    $clean = (($word.ToLowerInvariant() -replace '[^a-z0-9]', ' ') -replace '\s+', ' ').Trim()
+    if ($clean -and $clean -notmatch ' ') { $script:PriorityWordSet[$clean] = $true }
+}
+$script:CommonWordSet = @{}
+$commonFile = Join-Path $PSScriptRoot 'common_words.txt'
+if (Test-Path -LiteralPath $commonFile) {
+    foreach ($word in @(Get-Content -LiteralPath $commonFile -Encoding UTF8)) {
+        $clean = $word.Trim().ToLowerInvariant()
+        # 2, not 4. The old floor of four threw away and, or, of, no, may, vat
+        # -- the words that actually appear on a bill or a contract. A single
+        # character is still refused: OCR noise produces those by the dozen.
+        if ($clean.Length -ge 2) { $script:CommonWordSet[$clean] = $true }
+    }
+}
+# Any year a document is likely to carry. Cheaper than 51 lines in the file,
+# and it cannot drift out of date by being forgotten.
+foreach ($year in 2000..2050) { $script:CommonWordSet["$year"] = $true }
 
 # How the progress bar is weighted. One unit = one step spent on one page.
 # Both are set for real in Invoke-Run, once the path and the rotate setting are
@@ -445,13 +495,71 @@ function Export-PageImages([string]$Pdf, [int[]]$PageNumbers, [string]$Folder, [
 
 function ConvertTo-OrientationDecision([hashtable]$Osd) {
     # Same decision rule as prerotate.py: act on any angle the detector offers.
+    # "detector score", not "confidence": this is Tesseract's own OSD number,
+    # which is not a percentage and not the 0-100 word confidence used by the
+    # language check. Two different scales in one log need two different words.
     if ($Osd.turn -ne 0 -and $Osd.conf -ge $script:OsdConfidenceFloor) {
-        return @{ turn = $Osd.turn; why = ("confidence {0:F2}" -f $Osd.conf) }
+        return @{ turn = $Osd.turn; why = ("detector score {0:F2}" -f $Osd.conf) }
     }
     if ($Osd.conf -ge $script:OsdConfidenceFloor) {
-        return @{ turn = 0; why = ("already upright, confidence {0:F2}" -f $Osd.conf) }
+        return @{ turn = 0; why = ("already upright, detector score {0:F2}" -f $Osd.conf) }
     }
     return @{ turn = 0; why = 'too little text to tell which way up it is - left alone' }
+}
+
+function Get-NormalizedText([string]$Text) {
+    # Everything the comparison should not care about, removed: case,
+    # punctuation, line breaks, and the runs of spaces OCR leaves behind.
+    if (-not $Text) { return '' }
+    $t = $Text.ToLowerInvariant() -replace '[^a-z0-9]', ' '
+    return ($t -replace '\s+', ' ').Trim()
+}
+
+function Get-TsvWords([string]$Path) {
+    # Tesseract TSV has one word per level-5 row: confidence in column 11 and
+    # text in column 12. Return flat hashtables (D-018's PowerShell shape rule).
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    $out = New-Object Collections.Generic.List[object]
+    foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        $parts = @($line -split "`t", 12)
+        if ($parts.Count -lt 12 -or $parts[0] -ne '5') { continue }
+        try { $confidence = [double]::Parse($parts[10], [Globalization.CultureInfo]::InvariantCulture) }
+        catch { continue }
+        foreach ($word in @((Get-NormalizedText $parts[11]) -split ' ' | Where-Object { $_ })) {
+            [void]$out.Add(@{ word = $word; confidence = $confidence })
+        }
+    }
+    return $out.ToArray()
+}
+
+function Get-LanguageEvidence([object[]]$Words) {
+    # Score one rotation: one point per known word read, every time it appears.
+    # Returns @{ decided; score; why }.
+    #
+    # `decided` only means "stop searching now". `score` is the real output:
+    # Get-OrientationBatch compares the four rotations with it, so a page that
+    # never clears the bar is still decided by evidence rather than by OSD.
+    #
+    # Case cannot matter: Get-NormalizedText has already lower-cased the page
+    # and both word sets were built lower-cased.
+    $score = 0
+    $priority = 0
+    foreach ($item in $Words) {
+        if ([double]$item.confidence -lt $script:WordConfidence) { continue }
+        $word = ([string]$item.word).ToLowerInvariant()
+        if ($script:PriorityWordSet.ContainsKey($word)) { $priority++; continue }
+        if ($script:CommonWordSet.ContainsKey($word)) { $score++ }
+    }
+    if ($priority -gt 0) { $score += $script:ScorePriority }
+    $why = ''
+    if ($priority -gt 0) {
+        # WHICH word matched is never said. That it came from the list is not a
+        # leak, and without it the log cannot explain itself.
+        $why = 'a word from your list'
+    } elseif ($score -ge $script:ScoreToDecide) {
+        $why = "$score words matched"
+    }
+    return @{ decided = [bool]$why; score = $score; why = $why }
 }
 
 function Get-CropRects([int]$Width, [int]$Height, [int]$Count) {
@@ -507,7 +615,7 @@ function New-OsdCrops([string]$Png, [int]$Count) {
 function Get-CropVerdict([object[]]$Crops) {
     # Tally the sample windows. Returns @{ decided; turn; why; voters }.
     #
-    # Separate from Resolve-OrientationVote because the ANSWER TO decided
+    # Separate from Resolve-Orientation because the ANSWER TO decided
     # decides whether the whole-page check has to run at all. On a page whose
     # windows agree, it does not -- and that call is the expensive one
     # (a full A4 at 300 dpi is ~20x the pixels of one 650 px window).
@@ -530,20 +638,15 @@ function Get-CropVerdict([object[]]$Crops) {
     return @{ decided = $false; turn = 0; why = ''; voters = $voters }
 }
 
-function Resolve-OrientationVote([object[]]$Crops, [hashtable]$FullPage) {
-    # Let the crops of one page vote, and fall back to the whole-page answer.
+function Resolve-Orientation([object[]]$Crops, [hashtable]$FullPage) {
+    # The decision, plus what to do when it cannot be made.
     #
     # $Crops are RAW OSD readings @{turn;conf}, deliberately not decisions.
     # ConvertTo-OrientationDecision flattens "no confidence" into turn 0, which
     # reads as a vote for "upright" -- a completely different claim from "no
-    # opinion". Voting on decisions would stuff the ballot with silent crops.
+    # opinion". Voting on decisions would stuff the ballot with silent windows.
     #
-    # Two crops agreeing beats the whole page, because the whole page is the
-    # measurement that is wrong ~10% of the time: at 300 dpi it is mostly
-    # margin, and border noise, stamps and footer text drag OSD off the body
-    # text. A 650 px window is body text or nothing.
-    #
-    # Crops that answer but disagree are the case nobody could see before: the
+    # Windows that answer but disagree are the case nobody could see before: the
     # page is kept on the whole-page answer, but the disagreement is said out
     # loud, so a confidently wrong angle stops being indistinguishable from a
     # confidently right one.
@@ -556,74 +659,53 @@ function Resolve-OrientationVote([object[]]$Crops, [hashtable]$FullPage) {
     return $FullPage
 }
 
-function Get-OrientationBatch([string[]]$Pngs, [int]$Offset = 0, [int]$Total = 0) {
-    # Two rounds, and the second one usually runs for almost nobody.
-    #
-    #   round 1  -OsdCrops small windows per page, which vote
-    #   round 2  the whole-page `--psm 0` check -- ONLY for the pages whose
-    #            windows did not reach a majority
-    #
-    # The whole-page check is the expensive one: an A4 at 300 dpi is about 20x
-    # the pixels of one 650 px window. Running it on every page as well as the
-    # windows was pure waste, because a page whose windows agree never consults
-    # it. Five windows is roughly a quarter of the pixel work of the single
-    # whole-page call this replaces; what it adds is process launches, which is
-    # why -Jobs runs them in parallel and why -OsdCrops 3 is the cheap setting.
-    #
-    # -OsdCrops 0 skips round 1 entirely, which is exactly the old behaviour.
+function Get-OsdOrientationBatch([string[]]$Pngs) {
+    # The D-024 detector is the fallback only: sample windows first, then the
+    # whole page when fewer than two samples agree.
     if ($Pngs.Count -eq 0) { return @() }
-    $total = $(if ($Total) { $Total } else { $Pngs.Count })
     $out = New-Object 'object[]' $Pngs.Count
-    $verdict = New-Object 'object[]' $Pngs.Count
-    $raw = New-Object 'object[]' $Pngs.Count
+    $rawCrops = New-Object 'object[]' $Pngs.Count
+    for ($i = 0; $i -lt $Pngs.Count; $i++) {
+        $rawCrops[$i] = New-Object 'object[]' 0
+    }
+    $temp = New-Object Collections.Generic.List[string]
 
-    # --- round 1: the sample windows -------------------------------------
-    $cropFiles = New-Object Collections.Generic.List[string]
     try {
         if ($script:OsdCrops -gt 0) {
             $calls = New-Object Collections.Generic.List[object]
-            $cropCount = New-Object 'int[]' $Pngs.Count
-            $firstCall = New-Object 'int[]' $Pngs.Count
+            $first = New-Object 'int[]' $Pngs.Count
+            $count = New-Object 'int[]' $Pngs.Count
             for ($i = 0; $i -lt $Pngs.Count; $i++) {
-                $firstCall[$i] = $calls.Count
+                $first[$i] = $calls.Count
                 $crops = @(New-OsdCrops $Pngs[$i] $script:OsdCrops)
-                $cropCount[$i] = $crops.Count
+                $count[$i] = $crops.Count
                 foreach ($c in $crops) {
-                    [void]$cropFiles.Add($c)
-                    # min_characters_to_try only goes on the windows. A window
-                    # holds less text than a page and the default (50) makes OSD
-                    # refuse to try on samples that are perfectly readable.
+                    [void]$temp.Add($c)
                     [void]$calls.Add(@{ exe = $script:Tesseract
                                         engineArgs = @($c, 'stdout', '--psm', '0', '-l', 'osd',
                                                        '-c', 'min_characters_to_try=20') })
                 }
             }
-            # Silent: several calls per page would count past the page total.
-            # The stage line and the bar are stepped once per page at the end,
-            # still document-scoped (D-021).
-            $res = @(Invoke-EngineBatch $calls.ToArray() '' 0 0 0 $false)
-            for ($i = 0; $i -lt $Pngs.Count; $i++) {
-                $r = New-Object 'object[]' $cropCount[$i]
-                for ($k = 0; $k -lt $cropCount[$i]; $k++) {
-                    $one = $res[$firstCall[$i] + $k]
-                    $r[$k] = ConvertFrom-OsdOutput ($one.out + $one.err)
+            if ($calls.Count -gt 0) {
+                $res = @(Invoke-EngineBatch $calls.ToArray() '' 0 0 0 $false)
+                for ($i = 0; $i -lt $Pngs.Count; $i++) {
+                    $r = New-Object 'object[]' $count[$i]
+                    for ($k = 0; $k -lt $count[$i]; $k++) {
+                        $one = $res[$first[$i] + $k]
+                        $r[$k] = ConvertFrom-OsdOutput ($one.out + $one.err)
+                    }
+                    $rawCrops[$i] = $r
                 }
-                $raw[$i] = $r
-                $verdict[$i] = Get-CropVerdict $r
-            }
-        } else {
-            for ($i = 0; $i -lt $Pngs.Count; $i++) {
-                $raw[$i] = New-Object 'object[]' 0
-                $verdict[$i] = @{ decided = $false; turn = 0; why = ''; voters = 0 }
             }
         }
 
-        # --- round 2: the whole page, only where the windows could not decide -
         $needFull = New-Object Collections.Generic.List[int]
         for ($i = 0; $i -lt $Pngs.Count; $i++) {
-            if (-not $verdict[$i].decided) { [void]$needFull.Add($i) }
+            $v = Get-CropVerdict $rawCrops[$i]
+            if ($v.decided) { $out[$i] = @{ turn = $v.turn; why = $v.why } }
+            else { [void]$needFull.Add($i) }
         }
-        $fullRes = @()
+
         if ($needFull.Count -gt 0) {
             $calls2 = New-Object Collections.Generic.List[object]
             foreach ($i in $needFull) {
@@ -631,23 +713,163 @@ function Get-OrientationBatch([string[]]$Pngs, [int]$Offset = 0, [int]$Total = 0
                                      engineArgs = @($Pngs[$i], 'stdout', '--psm', '0', '-l', 'osd') })
             }
             $fullRes = @(Invoke-EngineBatch $calls2.ToArray() '' 0 0 0 $false)
-        }
-
-        $slot = 0
-        for ($i = 0; $i -lt $Pngs.Count; $i++) {
-            if ($verdict[$i].decided) {
-                $out[$i] = @{ turn = $verdict[$i].turn; why = $verdict[$i].why }
-            } else {
+            $slot = 0
+            foreach ($i in $needFull) {
                 $one = $fullRes[$slot]; $slot++
                 $full = ConvertTo-OrientationDecision (ConvertFrom-OsdOutput ($one.out + $one.err))
-                $out[$i] = Resolve-OrientationVote $raw[$i] $full
+                $out[$i] = Resolve-Orientation $rawCrops[$i] $full
+            }
+        }
+        return $out
+    } finally {
+        foreach ($c in $temp) { Remove-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-OrientationBatch {
+    param(
+        [string[]]$Pngs, [int]$Offset = 0, [int]$Total = 0,
+        [string]$Lang = 'eng', [int]$Dpi = 300, [string]$TrialDir = ''
+    )
+    # Whole-page recognition is the strongest orientation test. Each rotation
+    # emits TSV for scoring; Path B also emits its final searchable PDF in that
+    # same call. Only pages without language evidence reach OSD.
+    if ($Pngs.Count -eq 0) { return @() }
+    $total = $(if ($Total) { $Total } else { $Pngs.Count })
+    # The configured lexical evidence is English. In Arabic-only mode it can
+    # never fire, so do not pay for four guaranteed-empty recognition passes.
+    if ($Lang -eq 'ara') {
+        $arabicFallback = @(Get-OsdOrientationBatch $Pngs)
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            $arabicFallback[$i]['pdf'] = ''
+            Show-Stage 'checking orientation of' ($Offset + $i + 1) $total
+            Update-Progress 1
+        }
+        return $arabicFallback
+    }
+    $wantPdf = -not [string]::IsNullOrEmpty($TrialDir)
+    if ($wantPdf) { [IO.Directory]::CreateDirectory($TrialDir) | Out-Null }
+
+    $out = New-Object 'object[]' $Pngs.Count
+    $work = New-Object 'object[]' $Pngs.Count
+    $currentTurn = New-Object 'int[]' $Pngs.Count
+    $trialBases = New-Object 'object[]' $Pngs.Count
+    # Best rotation seen so far for a page that has not cleared the bar. This
+    # is what keeps OSD away from any page carrying readable text at all.
+    $bestScore = New-Object 'int[]' $Pngs.Count
+    $bestTurn = New-Object 'int[]' $Pngs.Count
+    for ($i = 0; $i -lt $Pngs.Count; $i++) {
+        $work[$i] = "$($Pngs[$i]).orientation.png"
+        Copy-Item -LiteralPath $Pngs[$i] -Destination $work[$i] -Force
+        $trialBases[$i] = @{}
+    }
+
+    try {
+        foreach ($turn in $script:OrientationTurns) {
+            $calls = New-Object Collections.Generic.List[object]
+            $slots = New-Object Collections.Generic.List[int]
+            for ($i = 0; $i -lt $Pngs.Count; $i++) {
+                if ($null -ne $out[$i]) { continue }
+                $delta = (($turn - $currentTurn[$i]) + 360) % 360
+                if ($delta) { Set-ImageRotation $work[$i] $delta }
+                $currentTurn[$i] = $turn
+                $base = if ($wantPdf) {
+                    Join-Path $TrialDir ("orientation_{0}_{1}" -f ($Offset + $i), $turn)
+                } else { "$($Pngs[$i]).orientation_$turn" }
+                $trialBases[$i][$turn] = $base
+                $engineArgs = @($work[$i], $base, '--dpi', "$Dpi", '-l', $Lang)
+                if ($wantPdf) { $engineArgs += @('pdf', 'tsv') } else { $engineArgs += @('tsv') }
+                [void]$calls.Add(@{ exe = $script:Tesseract; engineArgs = $engineArgs })
+                [void]$slots.Add($i)
+            }
+            if ($calls.Count -eq 0) { break }
+            Show-Stage ("testing ${turn}-degree orientation on") $Offset $total
+            $results = @(Invoke-EngineBatch $calls.ToArray() '' 0 0 0 $false)
+            for ($slot = 0; $slot -lt $slots.Count; $slot++) {
+                $i = $slots[$slot]
+                $base = [string]$trialBases[$i][$turn]
+                if ($results[$slot].code -ne 0) { continue }
+                $evidence = Get-LanguageEvidence @(Get-TsvWords "$base.tsv")
+                if ([int]$evidence.score -gt $bestScore[$i]) {
+                    $bestScore[$i] = [int]$evidence.score
+                    $bestTurn[$i] = $turn
+                }
+                if ($evidence.decided) {
+                    $pdf = $(if ($wantPdf -and (Test-Path -LiteralPath "$base.pdf")) { "$base.pdf" } else { '' })
+                    $out[$i] = @{ turn = $turn; why = $evidence.why; pdf = $pdf }
+                }
+            }
+        }
+
+        # A page that cleared nobody's bar but still read as SOMETHING at one
+        # rotation is decided by comparison: the best of the four wins.
+        #
+        # This is the fix for the worst failure this code has had. The sample
+        # windows are five crops of ONE page, so they are not five independent
+        # opinions -- when OSD misreads a layout it misreads every crop the same
+        # way, and "4 of 5 samples agree" is agreement about nothing. Eighteen
+        # upright pages were turned over by exactly that. OSD is now unreachable
+        # for any page where a single known word was read at any rotation.
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            if ($null -ne $out[$i] -or $bestScore[$i] -le 0) { continue }
+            $turn = $bestTurn[$i]
+            $pdf = ''
+            if ($wantPdf -and $trialBases[$i].ContainsKey($turn)) {
+                $candidate = ([string]$trialBases[$i][$turn]) + '.pdf'
+                if (Test-Path -LiteralPath $candidate) { $pdf = $candidate }
+            }
+            $out[$i] = @{ turn = $turn; pdf = $pdf
+                          why = "best of four rotations, $($bestScore[$i]) words matched" }
+        }
+
+        # Only a page with no known word at ANY rotation reaches the detector.
+        $fallbackPngs = New-Object Collections.Generic.List[string]
+        $fallbackSlots = New-Object Collections.Generic.List[int]
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            if ($null -eq $out[$i]) {
+                [void]$fallbackPngs.Add($Pngs[$i]); [void]$fallbackSlots.Add($i)
+            }
+        }
+        if ($fallbackSlots.Count -gt 0) {
+            $fallback = @(Get-OsdOrientationBatch $fallbackPngs.ToArray())
+            for ($slot = 0; $slot -lt $fallbackSlots.Count; $slot++) {
+                $i = $fallbackSlots[$slot]
+                $decision = $fallback[$slot]
+                $pdf = ''
+                $chosenTurn = [int]$decision.turn
+                if ($wantPdf -and $trialBases[$i].ContainsKey($chosenTurn)) {
+                    $candidate = ([string]$trialBases[$i][$chosenTurn]) + '.pdf'
+                    if (Test-Path -LiteralPath $candidate) { $pdf = $candidate }
+                }
+                $out[$i] = @{ turn = $chosenTurn
+                              why = "no known words at any rotation, $([string]$decision.why)"
+                              pdf = $pdf }
+            }
+        }
+
+        # Keep only the selected PDF. TSV and rejected rotations are temporary.
+        for ($i = 0; $i -lt $Pngs.Count; $i++) {
+            $keep = [string]$out[$i].pdf
+            foreach ($base in $trialBases[$i].Values) {
+                Remove-Item -LiteralPath "$base.tsv" -Force -ErrorAction SilentlyContinue
+                $candidate = "$base.pdf"
+                if ($candidate -ne $keep) {
+                    Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+                }
             }
             Show-Stage 'checking orientation of' ($Offset + $i + 1) $total
             Update-Progress 1
         }
         return $out
     } finally {
-        foreach ($c in $cropFiles) { Remove-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue }
+        foreach ($path in $work) {
+            if ($path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+        for ($i = 0; $i -lt $trialBases.Count; $i++) {
+            foreach ($base in $trialBases[$i].Values) {
+                Remove-Item -LiteralPath "$base.tsv" -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 
@@ -690,32 +912,38 @@ function Publish-Output([string]$Completed, [string]$Target) {
 function Set-PageOrientation([string]$Png, [int]$PageNo, [hashtable]$Decision, $Report) {
     if ($Decision.turn) {
         Set-ImageRotation $Png $Decision.turn
-        Emit 'log' @{ kind = 'turn'; text = "Page ${PageNo}: turned $($Decision.turn) degrees clockwise - $($Decision.why)" }
-        Write-Report $Report "   page ${PageNo}: turned $($Decision.turn) deg clockwise ($($Decision.why))"
+        Emit 'log' @{ kind = 'turn'; text = "Page ${PageNo}: turned $($Decision.turn) cw - $($Decision.why)" }
+        Write-Report $Report "   page ${PageNo}: turned $($Decision.turn) cw ($($Decision.why))"
     } else {
-        Emit 'log' @{ kind = 'dim'; text = "Page ${PageNo}: $($Decision.why)" }
-        Write-Report $Report "   page ${PageNo}: left upright ($($Decision.why))"
+        Emit 'log' @{ kind = 'dim'; text = "Page ${PageNo}: upright - $($Decision.why)" }
+        Write-Report $Report "   page ${PageNo}: upright ($($Decision.why))"
     }
 }
 
-function Set-BatchOrientation([string[]]$Pngs, [int[]]$PageNumbers, [int]$Offset, [int]$Total, $Report) {
+function Set-BatchOrientation {
+    param(
+        [string[]]$Pngs, [int[]]$PageNumbers, [int]$Offset, [int]$Total,
+        $Report, [string]$Lang = 'eng', [int]$Dpi = 300, [string]$TrialDir = ''
+    )
     # Check orientation a wave at a time, where a wave is the number of pages
     # actually running at once, and write each wave's LOG lines as soon as it
     # lands. Handing the whole chunk over in one call produced no log lines
     # until every page in the chunk had been checked, which looks frozen.
     #
-    # The stage line and the progress bar do not wait for the wave: they are
-    # updated by Invoke-EngineBatch as each individual process exits. The wave
-    # is only the granularity of the "Page 7: turned 90 degrees" log lines,
-    # because a rotation cannot be reported before its own process has answered.
+    # Each candidate rotation updates the stage line before its batch starts.
+    # The progress bar advances once the page's final orientation is known; a
+    # rejected candidate is internal work, not another completed page.
+    $out = New-Object 'object[]' $Pngs.Count
     for ($w = 0; $w -lt $Pngs.Count; $w += $script:MaxParallel) {
         $end = [Math]::Min($Pngs.Count, $w + $script:MaxParallel) - 1
         $wave = @($Pngs[$w..$end])
-        $turns = @(Get-OrientationBatch $wave ($Offset + $w) $Total)
+        $turns = @(Get-OrientationBatch $wave ($Offset + $w) $Total $Lang $Dpi $TrialDir)
         for ($k = 0; $k -lt $wave.Count; $k++) {
             Set-PageOrientation $wave[$k] $PageNumbers[$w + $k] $turns[$k] $Report
+            $out[$w + $k] = $turns[$k]
         }
     }
+    return $out
 }
 
 function Invoke-OneDocument {
@@ -739,7 +967,7 @@ function Invoke-OneDocument {
         $slice = [int[]]@($pageNumbers[$i..(Get-ChunkEnd $pageNumbers.Count $i $script:ChunkPages)])
         $pngs = @(Export-PageImages $Source $slice (Join-Path $pageDir ("c{0:D5}" -f $slice[0])) $Dpi $i $count)
 
-        if ($Rotate) { Set-BatchOrientation $pngs $slice $i $count $Report }
+        if ($Rotate) { [void](Set-BatchOrientation $pngs $slice $i $count $Report $Lang $Dpi) }
 
         for ($k = 0; $k -lt $slice.Count; $k++) {
             [void]$images.Add($pngs[$k])
@@ -887,9 +1115,13 @@ function Invoke-OneDocumentLossless {
     # Say the split out loud. Without it the stage line counts "of 20 pages"
     # while the file row counts "of 22" and there is nothing on screen
     # explaining where the other two went.
-    Emit 'log' @{ kind = 'dim'; text = ("$name - $skipped of $count page(s) already have text and are kept " +
-                                        "unchanged; $($need.Count) page(s) need OCR") }
+    Emit 'log' @{ kind = 'dim'; text = ("$name - $skipped of $count page(s) can already be searched, so " +
+                                        "they are copied straight from the original; " +
+                                        "$($need.Count) page(s) are scans and need OCR") }
     Write-Report $Report "   $skipped of $count page(s) already have text; $($need.Count) need OCR"
+    if ($Rotate -and $Lang -ne 'ara' -and $need.Count -gt 0) {
+        Emit 'log' @{ kind = 'dim'; text = "$name - each page is read as its rotation is checked, never twice" }
+    }
 
     # --- phase 2: OCR the scanned pages, straight to disk -------------------
     # ponytail: one PDF per page, so phase 3 opens as many documents as there
@@ -907,25 +1139,47 @@ function Invoke-OneDocumentLossless {
         # "of this chunk", so the numbers keep rising across chunk boundaries.
         $pngs = @(Export-PageImages $Source $slice $chunkDir $Dpi $i $needTotal)
 
-        if ($Rotate) { Set-BatchOrientation $pngs $slice $i $needTotal $Report }
+        $orientation = @()
+        if ($Rotate) {
+            $orientation = @(Set-BatchOrientation $pngs $slice $i $needTotal $Report $Lang $Dpi $chunkDir)
+        }
 
         $calls = New-Object Collections.Generic.List[object]
+        $callSlots = New-Object Collections.Generic.List[int]
+        $cached = 0
         for ($k = 0; $k -lt $slice.Count; $k++) {
+            if ($Rotate -and $k -lt $orientation.Count -and
+                $orientation[$k].pdf -and (Test-Path -LiteralPath $orientation[$k].pdf)) {
+                $ocrPdf[$slice[$k]] = [string]$orientation[$k].pdf
+                $cached++
+                Show-Stage 'recognising text on' ($i + $cached) $needTotal
+                Update-Progress 1
+                Step-Document 1
+                # No log line: this page's text came from the reading that
+                # proved its rotation, and that line already said so. A second
+                # line per page saying the same thing every time is noise.
+                continue
+            }
             [void]$calls.Add(@{
                 exe = $script:Tesseract
                 engineArgs = @($pngs[$k], (Join-Path $chunkDir ("p{0:D5}" -f $slice[$k])),
                                '--dpi', "$Dpi", '-l', $Lang, 'pdf')
-                label = "Page $($slice[$k]): text recognised"
+                label = "Page $($slice[$k]): text layer added"
             })
+            [void]$callSlots.Add($k)
         }
         # The file row and the bar move as each page's own process exits, from
         # inside the runner -- not in this loop, which cannot run until every
         # process in the chunk has finished.
-        $res = @(Invoke-EngineBatch $calls.ToArray() 'recognising text on' $i $needTotal 1 $true)
-        for ($k = 0; $k -lt $slice.Count; $k++) {
+        $res = @()
+        if ($calls.Count -gt 0) {
+            $res = @(Invoke-EngineBatch $calls.ToArray() 'recognising text on' ($i + $cached) $needTotal 1 $true)
+        }
+        for ($slot = 0; $slot -lt $callSlots.Count; $slot++) {
+            $k = $callSlots[$slot]
             $onePdf = (Join-Path $chunkDir ("p{0:D5}.pdf" -f $slice[$k]))
-            if ($res[$k].code -ne 0 -or -not (Test-Path -LiteralPath $onePdf)) {
-                throw "Tesseract could not build page $($slice[$k]) ($($res[$k].err.Trim()))"
+            if ($res[$slot].code -ne 0 -or -not (Test-Path -LiteralPath $onePdf)) {
+                throw "Tesseract could not build page $($slice[$k]) ($($res[$slot].err.Trim()))"
             }
             $ocrPdf[$slice[$k]] = $onePdf
         }
@@ -949,8 +1203,8 @@ function Invoke-OneDocumentLossless {
                 [void]$output.AddPage($ocrDoc.Pages[0])
             } else {
                 [void]$output.AddPage($reader.Pages[$p - 1])   # untouched, lossless
-                Emit 'log' @{ kind = 'dim'; text = "Page ${p}: already has text - kept unchanged" }
-                Write-Report $Report "   page ${p}: already has text - kept unchanged"
+                Emit 'log' @{ kind = 'dim'; text = "Page ${p}: already searchable - copied from the original" }
+                Write-Report $Report "   page ${p}: already searchable - copied from the original"
             }
             # Assembly is fast, but on a 350-page file it is still long enough
             # to look like a hang if it says nothing, so it counts too.
@@ -974,6 +1228,19 @@ function Invoke-OneDocumentLossless {
 
 # --- the run ---------------------------------------------------------------
 function Invoke-Run([hashtable]$Job) {
+    # Which build is this? Written by package_pc.sh into the package; absent in
+    # a working copy. First line of every run, before anything can go wrong,
+    # because two rounds of "why is the log still saying X" turned out to be a
+    # stale folder on the target PC that nothing on screen could distinguish.
+    $script:BuildStamp = ''
+    $stampFile = Join-Path $PSScriptRoot 'build.txt'
+    if (Test-Path -LiteralPath $stampFile) {
+        $script:BuildStamp = ((Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue) + '').Trim()
+        if ($script:BuildStamp) {
+            Emit 'log' @{ kind = 'head'; text = "Build $script:BuildStamp" }
+        }
+    }
+
     $opts = $Job.options
     $outputDir = $Job.output_dir
     $jobDir    = $Job.job_dir
@@ -988,6 +1255,13 @@ function Invoke-Run([hashtable]$Job) {
     if ($opts.ContainsKey('chunk'))  { $script:ChunkPages  = [Math]::Max(1, [int]$opts.chunk) }
     if ($opts.ContainsKey('text_min')) { $script:TextMinChars = [Math]::Max(1, [int]$opts.text_min) }
     if ($opts.ContainsKey('osd_crops')) { $script:OsdCrops = [Math]::Max(0, [Math]::Min(5, [int]$opts.osd_crops)) }
+    if ($opts.ContainsKey('priority_words')) {
+        $script:PriorityWordSet = @{}
+        foreach ($word in @($opts.priority_words | Where-Object { $_ -and $_.Trim().Length -gt 0 })) {
+            $clean = (Get-NormalizedText $word)
+            if ($clean -and $clean -notmatch ' ') { $script:PriorityWordSet[$clean] = $true }
+        }
+    }
 
     if (-not (Test-Path -LiteralPath $outputDir -PathType Container)) {
         Emit 'fatal' @{ text = "Output folder does not exist: $outputDir" }; return 2
@@ -1054,6 +1328,7 @@ function Invoke-Run([hashtable]$Job) {
     if ($Job.ContainsKey('report_path') -and $Job.report_path) {
         $report = New-Object IO.StreamWriter($Job.report_path, $false, (New-Object Text.UTF8Encoding($false)))
         Write-Report $report "Document OCR native worker report (tesseract + ghostscript)"
+        if ($script:BuildStamp) { Write-Report $report "Build $script:BuildStamp" }
         Write-Report $report "Output: $outputDir"
         Write-Report $report ("Options: lang=$lang rotate=$rotate dpi=$dpi")
         Write-Report $report ("Speed: jobs=$($script:MaxParallel) chunk=$($script:ChunkPages)")
@@ -1246,30 +1521,30 @@ function Invoke-SelfTestBody {
     $silent = @(@{ turn = 0; conf = 0.0 }, @{ turn = 0; conf = 0.0 }, @{ turn = 0; conf = 0.0 })
 
     $agree = @(@{ turn = 90; conf = 4.0 }, @{ turn = 90; conf = 3.0 }, @{ turn = 0; conf = 0.0 })
-    $v = Resolve-OrientationVote $agree $pageSaysNothing
+    $v = Resolve-Orientation $agree $pageSaysNothing
     Check 'two agreeing samples rescue a page the whole page could not read' (
         $v.turn -eq 90 -and $v.why -like '*samples agree*')
 
     # The confidently-wrong case: the page is sure and wrong, the samples are not.
     $sayUpright = @(@{ turn = 0; conf = 4.0 }, @{ turn = 0; conf = 3.5 }, @{ turn = 0; conf = 2.0 })
-    $v = Resolve-OrientationVote $sayUpright $pageSays180
+    $v = Resolve-Orientation $sayUpright $pageSays180
     Check 'agreeing samples overrule a confident whole page' ($v.turn -eq 0)
 
     $split = @(@{ turn = 90; conf = 4.0 }, @{ turn = 180; conf = 3.0 }, @{ turn = 270; conf = 2.0 })
-    $v = Resolve-OrientationVote $split $pageSays180
+    $v = Resolve-Orientation $split $pageSays180
     Check 'samples that all disagree fall back to the whole page' ($v.turn -eq 180)
     Check 'a disagreement is said out loud' ($v.why -like '*disagree*')
 
     $tie = @(@{ turn = 90; conf = 4.0 }, @{ turn = 90; conf = 4.0 },
              @{ turn = 270; conf = 4.0 }, @{ turn = 270; conf = 4.0 })
-    $v = Resolve-OrientationVote $tie $pageSaysUpright
+    $v = Resolve-Orientation $tie $pageSaysUpright
     Check 'a tied vote does not pick a side' ($v.turn -eq 0 -and $v.why -like '*disagree*')
 
-    $v = Resolve-OrientationVote $silent $pageSays180
+    $v = Resolve-Orientation $silent $pageSays180
     Check 'silent samples are not votes for upright' ($v.turn -eq 180 -and $v.why -eq $pageSays180.why)
-    $v = Resolve-OrientationVote @(@{ turn = 90; conf = 4.0 }) $pageSaysNothing
+    $v = Resolve-Orientation @(@{ turn = 90; conf = 4.0 }) $pageSaysNothing
     Check 'one lone sample is not a majority' ($v.turn -eq 0)
-    $v = Resolve-OrientationVote @() $pageSays180
+    $v = Resolve-Orientation @() $pageSays180
     Check 'no samples at all leaves the whole page answer untouched' (
         $v.turn -eq 180 -and $v.why -eq $pageSays180.why)
 
@@ -1287,6 +1562,80 @@ function Invoke-SelfTestBody {
         -not $d.decided -and $d.voters -eq 0)
     $d = Get-CropVerdict @()
     Check 'no samples decides nothing' (-not $d.decided -and $d.voters -eq 0)
+
+    # --- whole-page language evidence ----------------------------------
+    Check 'normalise strips case and punctuation' (
+        (Get-NormalizedText "  NORTHERN Utilities-Board!! ") -eq 'northern utilities board')
+    Check 'normalise handles nothing' ((Get-NormalizedText $null) -eq '')
+    $savedPriority = $script:PriorityWordSet
+    $savedCommon = $script:CommonWordSet
+    $script:PriorityWordSet = @{ northstar = $true }
+    $script:CommonWordSet = @{ and = $true; of = $true; or = $true
+                               shall = $true; invoice = $true; '2024' = $true }
+    try {
+        $v = Get-LanguageEvidence @(@{ word = 'northstar'; confidence = 90.0 })
+        Check 'one configured exact word proves orientation' ($v.decided)
+        Check 'a configured word outweighs any amount of common text' ($v.score -gt 900)
+        $v = Get-LanguageEvidence @(@{ word = 'northstar'; confidence = 69.0 })
+        Check 'a low-confidence configured word proves nothing' (
+            -not $v.decided -and $v.score -eq 0)
+
+        # One point per hit, three to pass. The three ways to get there must
+        # all work, because "three hits" is the entire rule.
+        $w = { param($t, $n) @(1..$n | ForEach-Object { @{ word = $t; confidence = 80.0 } }) }
+        Check 'one word three times passes' (
+            (Get-LanguageEvidence (& $w 'and' 3)).decided)
+        Check 'three different words pass' (
+            (Get-LanguageEvidence @(@{ word = 'and'; confidence = 80.0 },
+                                    @{ word = 'of'; confidence = 80.0 },
+                                    @{ word = 'invoice'; confidence = 80.0 })).decided)
+        Check 'two of one word plus another passes' (
+            (Get-LanguageEvidence @(@{ word = 'and'; confidence = 80.0 },
+                                    @{ word = 'and'; confidence = 80.0 },
+                                    @{ word = 'of'; confidence = 80.0 })).decided)
+        Check 'a year is an ordinary word and counts' (
+            (Get-LanguageEvidence (& $w '2024' 3)).decided)
+
+        # Two hits is not three, and repeats are never capped.
+        Check 'two hits do not pass' ((Get-LanguageEvidence (& $w 'and' 2)).decided -eq $false)
+        Check 'two hits still score' ((Get-LanguageEvidence (& $w 'and' 2)).score -eq 2)
+        Check 'repeats are not capped' ((Get-LanguageEvidence (& $w 'and' 40)).score -eq 40)
+        Check 'a long word repeated counts every time' (
+            (Get-LanguageEvidence (& $w 'invoice' 5)).score -eq 5)
+
+        # Case is not allowed to matter anywhere: the page arrives lower-cased
+        # from Get-NormalizedText, and the sets are built lower-cased.
+        Check 'matching ignores case' (
+            (Get-LanguageEvidence (& $w 'SHALL' 3)).decided -and
+            (Get-LanguageEvidence @(@{ word = 'NorthStar'; confidence = 90.0 })).decided)
+
+        Check 'gibberish proves nothing and scores nothing' (
+            -not (Get-LanguageEvidence (& $w 'xqzz' 9)).decided)
+        Check 'an empty page scores nothing' ((Get-LanguageEvidence @()).score -eq 0)
+
+        # More language must always out-score less, or the comparison in
+        # Get-OrientationBatch cannot tell an upright page from a rotated one.
+        $upright = @(@{ word = 'and'; confidence = 80.0 }, @{ word = 'of'; confidence = 80.0 },
+                     @{ word = 'invoice'; confidence = 80.0 }, @{ word = 'shall'; confidence = 80.0 })
+        Check 'more language out-scores less' (
+            (Get-LanguageEvidence $upright).score -gt (Get-LanguageEvidence (& $w 'and' 2)).score)
+        Check 'one hit beats none' (
+            (Get-LanguageEvidence (& $w 'and' 1)).score -gt
+            (Get-LanguageEvidence (& $w 'xqzz' 9)).score)
+
+        $leak = (Get-LanguageEvidence @(@{ word = 'northstar'; confidence = 90.0 })).why
+        # Worded so it still holds if the sentence is ever reworded: the reason
+        # may say the rule, never the word.
+        Check 'the reason never repeats a matched word' ($leak -notmatch 'northstar')
+        Check 'the reason names the rule that fired' ($leak -eq 'a word from your list')
+        # Four hits, four points. Spelled out so a change to the scoring fails
+        # here rather than silently shifting the bar.
+        Check 'the reason carries the score' (
+            (Get-LanguageEvidence $upright).why -eq '4 words matched')
+    } finally {
+        $script:PriorityWordSet = $savedPriority
+        $script:CommonWordSet = $savedCommon
+    }
 
     # The whole point of the split: a page whose windows agree must not pay for
     # the whole-page check. Count how many pages would still need it.
@@ -1323,6 +1672,16 @@ function Invoke-SelfTestBody {
         $c = Join-Path $tmp 'c.tmp'; Set-Content $c 'hi'
         $t = Join-Path $tmp 'pub.pdf'; Publish-Output $c $t
         Check 'publish' ((Get-Content $t) -eq 'hi')
+        $tsv = Join-Path $tmp 'words.tsv'
+        Set-Content -LiteralPath $tsv -Encoding UTF8 -Value @(
+            "level`tpage_num`tblock_num`tpar_num`tline_num`tword_num`tleft`ttop`twidth`theight`tconf`ttext",
+            "5`t1`t1`t1`t1`t1`t10`t20`t30`t40`t91.5`tExample!",
+            "4`t1`t1`t1`t1`t0`t0`t0`t0`t0`t-1`t",
+            "5`t1`t1`t1`t1`t2`t50`t20`t30`t40`t42.0`tignored")
+        $parsed = @(Get-TsvWords $tsv)
+        Check 'TSV parser keeps word rows with confidence' (
+            $parsed.Count -eq 2 -and $parsed[0].word -eq 'example' -and
+            [Math]::Abs($parsed[0].confidence - 91.5) -lt 0.01)
     } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
     Check 'tesseract present' (Test-Path -LiteralPath $script:Tesseract)
@@ -1365,7 +1724,7 @@ function Invoke-SelfTestBody {
             # throw under Set-StrictMode 2.0, which is the whole risk here.
             if (($p % 2) -eq 0) {
                 [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h')
-                                   label = "Page ${p}: text recognised" })
+                                   label = "Page ${p}: text layer added" })
             } else {
                 [void]$many.Add(@{ exe = $script:Ghostscript; engineArgs = @('-h') })
             }
